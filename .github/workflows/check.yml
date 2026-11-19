@@ -1,0 +1,29 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: make build
+      - run: make test
+      - run: make check
+      - if: runner.os == 'Linux'
+        run: make cross-check
+      # The reader's whole session on real Groundhog runners (about 40 s). Its
+      # wake part stays skipped: EASYHOG_WAKE_CONSUMER is not set here.
+      - if: runner.os == 'Linux'
+        run: make acceptance
