@@ -12,3 +12,4 @@ The first public release.
 - Retries failed deliveries and recovers uncertain ones, from the command palette.
 - `-version` prints the version.
 - macOS and Linux.
+
