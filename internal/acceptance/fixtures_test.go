@@ -11,17 +11,16 @@ import (
 // fixture names the synthetic repositories (each the .groundhog directory) and
 // what each one is for. Every name is made up; nothing here is a real project.
 type fixture struct {
-	alpha    string // no consumer: delivery only; an overdue once item, a future one, an every/ item
-	bravo    string // a plain-script consumer; three overdue items and an every/ item (the backlog)
-	charlie  string // a consumer that fails on purpose
-	delta    string // owned by another supervisor, its runner running
-	echo     string // owned by another supervisor, its runner stopped
-	foxtrot  string // a legacy (pre-runtime) script
-	golf     string // a current script whose `status` fails
-	hotel    string // malformed: script not executable, directories missing
-	private  string // an unreadable directory beneath the root
-	wake     *wakeFixture
-	wakeInst string
+	alpha   string // no run: delivery only; an overdue once item, a future one, a daily item
+	bravo   string // collect-note.sh as each item's run; three overdue items and a daily item
+	charlie string // daily items: fail-until-fixed.sh, and a run that fails once and then waits for a gate
+	delta   string // ticked from outside Easyhog a moment before the session opens
+	foxtrot string // a legacy (pre-runtime) script
+	india   string // an older Groundhog: runtime protocol 1
+	golf    string // a current script whose `status` fails
+	hotel   string // malformed: script not executable, directories missing
+	private string // an unreadable directory beneath the root
+	gate    string // charlie's slow run waits for this file
 }
 
 // legacyStub is what a script that predates the runtime does: it knows nothing
@@ -31,6 +30,17 @@ const legacyStub = `#!/usr/bin/env bash
 echo "$*" >> "$(dirname "$0")/../calls.log"
 echo "error: unknown command '$1'" >&2
 exit 1
+`
+
+// protocol1Stub answers `capabilities` as Groundhog did before items carried
+// their own run, and logs every call.
+const protocol1Stub = `#!/usr/bin/env bash
+echo "$*" >> "$(dirname "$0")/../calls.log"
+if [ "$1" = capabilities ]; then
+  echo '{"protocol":"groundhog-runtime","protocol_version":1,"capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]}'
+  exit 0
+fi
+exit 9
 `
 
 // brokenStatus wraps the real (renamed) script and makes only `status` fail.
@@ -44,45 +54,48 @@ exec bash "$here/real.sh" "$@"
 `
 
 // build creates the repositories. They are in place before Easyhog opens, so a
-// reader's first screen has to discover them all. wake may be nil.
-func (w *world) build(t *testing.T, wake *wakeFixture) *fixture {
+// reader's first screen has to discover them all.
+func (w *world) build(t *testing.T) *fixture {
 	t.Helper()
-	collect := repoFile(t, "examples", "consumers", "collect-note.sh")
-	failing := repoFile(t, "examples", "consumers", "fail-until-fixed.sh")
-	f := &fixture{wake: wake}
+	f := &fixture{gate: filepath.Join(w.tmp, "gate")}
+	t.Cleanup(func() { _ = os.WriteFile(f.gate, nil, 0o644) }) // a waiting run ends with the test
 
 	f.alpha = w.instance("alpha")
 	w.item(f.alpha, overdue, "old-note", "alpha overdue note")
-	// A payload file that would leave a canary if anything ever ran it.
+	// A payload file that would leave a canary if anything ever ran it: only an
+	// executable named `run` runs.
 	w.must(os.WriteFile(filepath.Join(f.alpha, "schedule", overdue, "old-note", "run-me.sh"),
 		[]byte("#!/bin/sh\ntouch "+filepath.Join(w.tmp, "canary")+"\n"), 0o755))
 	w.item(f.alpha, future, "future-note", "alpha future note")
-	w.item(f.alpha, "every/1h", "hourly", "alpha hourly note")
+	w.item(f.alpha, "daily", "day-note", "alpha daily note")
 
 	f.bravo = w.instance("team/bravo")
-	w.consumer(f.bravo, map[string]string{"COLLECT_DELAY": "2"}, "/bin/sh", collect)
+	collect := w.example("collect-note.sh")
 	for _, n := range []string{"b1", "b2", "b3"} {
 		w.item(f.bravo, overdue, n, "bravo note "+n)
+		w.run(f.bravo, overdue, n, collect)
 	}
-	w.item(f.bravo, "every/1h", "hourly", "bravo hourly note")
+	w.item(f.bravo, "daily", "day-note", "bravo daily note")
+	w.run(f.bravo, "daily", "day-note", collect)
 
+	// Daily, not one-shots: a one-shot's source goes when it fires, and the
+	// steps select these items' rows after they have fired.
 	f.charlie = w.instance("charlie")
-	w.consumer(f.charlie, nil, "/bin/sh", failing)
-	w.item(f.charlie, overdue, "c1", "charlie note")
+	w.item(f.charlie, "daily", "c1", "charlie note")
+	w.run(f.charlie, "daily", "c1", w.example("fail-until-fixed.sh"))
+	w.item(f.charlie, "daily", "c2", "charlie slow note")
+	// Fails at once the first time; every later attempt waits for the gate, then succeeds.
+	w.run(f.charlie, "daily", "c2", "#!/bin/sh\nif [ -e \"$1/tried\" ]; then\n  while [ ! -e '"+f.gate+"' ]; do sleep 0.1; done\n  exit 0\nfi\n: > \"$1/tried\"\necho 'failing once on purpose' >&2\nexit 1\n")
 
 	f.delta = w.instance("delta")
-	w.consumer(f.delta, nil, "/bin/sh", collect)
-	w.item(f.delta, overdue, "d1", "delta note")
-
-	f.echo = w.instance("echo")
-	w.item(f.echo, overdue, "e1", "echo note")
-	tokens := filepath.Join(w.tmp, "other-tokens")
-	w.must(os.MkdirAll(tokens, 0o700))
-	// Enrolled and never run: an owner is recorded and no runner is alive.
-	w.must(w.client(f.echo).Enroll(w.ctx, "stopped-supervisor", filepath.Join(tokens, "echo.token")))
+	w.item(f.delta, "daily", "day-note", "delta daily note")
+	w.hog(f.delta, "tick") // something outside Easyhog ticked it just now
 
 	f.foxtrot = w.instance("foxtrot")
 	w.must(os.WriteFile(filepath.Join(f.foxtrot, "groundhog.sh"), []byte(legacyStub), 0o755))
+
+	f.india = w.instance("india")
+	w.must(os.WriteFile(filepath.Join(f.india, "groundhog.sh"), []byte(protocol1Stub), 0o755))
 
 	f.golf = w.instance("golf")
 	w.must(os.Rename(filepath.Join(f.golf, "groundhog.sh"), filepath.Join(f.golf, "real.sh")))
@@ -97,9 +110,5 @@ func (w *world) build(t *testing.T, wake *wakeFixture) *fixture {
 	w.must(os.MkdirAll(filepath.Join(f.private, "inner"), 0o755))
 	w.must(os.Chmod(f.private, 0o000))
 	t.Cleanup(func() { _ = os.Chmod(f.private, 0o755) })
-
-	if wake != nil {
-		w.wakeRepo(t, f, wake)
-	}
 	return f
 }

@@ -117,34 +117,29 @@ func newClient(t *testing.T, f *fakeExec, opts ...Option) *Client {
 	return c
 }
 
-// fullCaps is a capabilities answer with all six capabilities.
+// fullCaps is a capabilities answer with everything protocol 2 offers.
 func fullCaps() map[string]any {
 	return map[string]any{
-		"protocol": "groundhog-runtime", "protocol_version": 1, "implementation_version": "example-build",
-		"capabilities": []string{"status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1"},
+		"protocol": "groundhog-runtime", "protocol_version": 2, "implementation_version": "example-build",
+		"capabilities": []string{"status-json-v2", "next-due-v1", "add-from-v1", "pause-v2", "handlers-v1"},
 	}
 }
 
 // snapshot returns a synthetic, fully populated status document.
 func snapshot() map[string]any {
 	return map[string]any{
-		"protocol": "groundhog-runtime", "protocol_version": 1,
+		"protocol": "groundhog-runtime", "protocol_version": 2,
 		"instance":    fakeInstance,
 		"observed_at": "2026-11-15T00:01:00Z",
-		"revision":    12, "journal_generation": 4,
-		"consistent": true, "paused": true,
-		"owner":  map[string]any{"id": "o-demo", "generation": 1, "label": "demo-session"},
-		"runner": map[string]any{"state": "stopped", "last_error": nil},
-		"consumer": map[string]any{
-			"configured": true, "valid": true, "config_digest": "sha256:example",
-		},
+		"paused":      true,
+		"last_tick":   map[string]any{"at": "2026-11-15T00:00:04Z", "source": "standalone"},
 		"schedule": []any{
 			map[string]any{
 				"path": "schedule/daily/nudge", "item_id": "nudge",
 				"cadence":   map[string]any{"axis": "daily", "day": nil, "date": nil, "time": "09:00", "interval": nil, "defaulted": false},
 				"paused_by": []string{}, "eligible_now": false,
 				"fired_marker": "fired/2026-11-15/daily/nudge", "fired": true,
-				"firing_allowed": false, "blocked_by": []string{"already_fired", "instance_paused", "owned"},
+				"firing_allowed": false, "blocked_by": []string{"already_fired", "instance_paused"},
 			},
 			map[string]any{
 				"path": "schedule/once/later", "item_id": "later", "cadence": nil,
@@ -154,26 +149,21 @@ func snapshot() map[string]any {
 		},
 		"deliveries": []any{
 			map[string]any{
-				"id": "d-demo-1", "path": "out/nudge-2026-11-15", "origin": "runtime",
-				"schedule_path": "schedule/daily/nudge",
-				"occurrence":    map[string]any{"date": "2026-11-15", "slot": nil},
-				"state":         "failed", "reason": nil, "execution": "unknown",
+				"path": "out/nudge-2026-11-15", "id": "d-3f9c0a1b2c3d4e5f", "state": "failed",
+				"fired_at": "2026-11-15T00:00:04Z", "schedule_path": "schedule/daily/nudge",
+				"occurrence": map[string]any{"date": "2026-11-15", "slot": nil},
+				"run":        true, "exit_status": 7,
 				"attempts": []any{
-					map[string]any{
-						"id": "a-demo-1", "started_at": "2026-11-15T00:00:30Z", "finished_at": "2026-11-15T00:00:31Z",
-						"outcome": "failed", "exit_code": 7, "signal": nil,
-						"error": map[string]any{"code": "consumer_failed", "message": "the consumer exited 7", "path": nil},
-					},
-					map[string]any{
-						"id": "a-demo-2", "started_at": "2026-11-15T00:00:40Z", "finished_at": nil,
-						"outcome": "unknown", "exit_code": nil, "signal": "SIGPIPE", "error": nil,
-						"decision": "retry", "decided_at": "2026-11-15T00:00:50Z",
-					},
+					map[string]any{"id": "a-77aa01b2c3d4e5f6", "started_at": "2026-11-15T00:00:04Z", "by": "tick",
+						"finished_at": "2026-11-15T00:00:31Z", "exit_status": 0},
+					map[string]any{"id": "a-88bb01b2c3d4e5f6", "started_at": "2026-11-15T00:00:40Z", "by": "retry",
+						"finished_at": "2026-11-15T00:00:41Z", "exit_status": 7},
 				},
+				"log": "out/nudge-2026-11-15/.groundhog-log",
 			},
 			map[string]any{
-				"id": nil, "path": "out/loose", "origin": "legacy_out", "schedule_path": nil, "occurrence": nil,
-				"state": "pending", "reason": "unregistered", "attempts": []any{}, "execution": "unknown",
+				"path": "out/loose", "id": nil, "state": "unrecorded", "fired_at": nil, "schedule_path": nil,
+				"occurrence": nil, "run": false, "exit_status": nil, "attempts": []any{}, "log": nil,
 			},
 		},
 		"diagnostics": []any{

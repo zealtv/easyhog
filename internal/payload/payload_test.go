@@ -164,3 +164,78 @@ func TestVanishedUnreadableAndNonDirectoryItems(t *testing.T) {
 		t.Errorf("empty: %s", got)
 	}
 }
+
+// An item's own run is what firing it does: it comes first, says whether it
+// runs, and is shown as text like any file. Nothing runs it.
+func TestTheItemsRunComesFirstAndIsReadAsText(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "ran")
+	inst := item(t, map[string][]byte{
+		"a-note.md": []byte("first by name\n"),
+		"run":       []byte("#!/bin/sh\ntouch " + marker + "\n"),
+	})
+	if err := os.Chmod(filepath.Join(inst, rel, "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got := Preview(OS{}, inst, rel)
+	if !strings.HasPrefix(got, "Runs when the item fires") || strings.Index(got, "run  ") > strings.Index(got, "a-note.md") ||
+		!strings.Contains(got, "    touch "+marker) {
+		t.Errorf("preview:\n%s", got)
+	}
+	if err := os.Chmod(filepath.Join(inst, rel, "run"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := Preview(OS{}, inst, rel); !strings.HasPrefix(got, "A file named run that is not executable") {
+		t.Errorf("preview:\n%s", got)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Error("the item's run ran")
+	}
+}
+
+func TestADeliveryLogIsReadAsBoundedTextAndNothingElse(t *testing.T) {
+	inst := t.TempDir()
+	dir := filepath.Join(inst, "out", "report-1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".groundhog-log"), []byte("hello\n"+strings.Repeat("x\n", 100)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := Log(OS{}, inst, "out/report-1/.groundhog-log")
+	if !strings.Contains(got, "    hello") || !strings.Contains(got, StartOnlyNote) {
+		t.Errorf("log:\n%s", got)
+	}
+	for _, bad := range []string{"out/report-1/run", "schedule/x/.groundhog-log", "out/../../etc/.groundhog-log", "out/missing/.groundhog-log"} {
+		if got := Log(OS{}, inst, bad); strings.Contains(got, "hello") || !strings.Contains(got, "not") {
+			t.Errorf("%s: %q", bad, got)
+		}
+	}
+	if err := os.Symlink(dir, filepath.Join(inst, "out", "alias")); err != nil {
+		t.Fatal(err)
+	}
+	if got := Log(OS{}, inst, "out/alias/.groundhog-log"); strings.Contains(got, "hello") {
+		t.Errorf("read through a symlink: %q", got)
+	}
+	both := ItemPreview(OS{}, inst, "out/report-1", []string{"out/report-1/.groundhog-log", "out/report-1/.groundhog-log", "out/report-1/.groundhog-log"})
+	if strings.Count(both, "Output of a run") != MaxLogs {
+		t.Errorf("logs shown: %d", strings.Count(both, "Output of a run"))
+	}
+}
+
+// A run that is a symbolic link runs all the same (Groundhog follows it), so
+// the preview says so, and still does not follow it.
+func TestALinkedRunIsNamedAsRunningAndNotFollowed(t *testing.T) {
+	inst := item(t, map[string][]byte{"note.md": []byte("hello\n")})
+	target := filepath.Join(t.TempDir(), "real-run.sh")
+	if err := os.WriteFile(target, []byte("#!/bin/sh\necho SECRET-BODY\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(inst, rel, "run")); err != nil {
+		t.Fatal(err)
+	}
+	got := Preview(OS{}, inst, rel)
+	if !strings.HasPrefix(got, "run: a link named run. Groundhog starts what it points to when the item fires") ||
+		strings.Contains(got, "SECRET-BODY") || !strings.Contains(got, "note.md") {
+		t.Errorf("preview:\n%s", got)
+	}
+}

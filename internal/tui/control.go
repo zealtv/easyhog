@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -14,33 +13,36 @@ import (
 	"github.com/zealtv/easyhog/internal/groundhog"
 )
 
-// Runners is what the palette's Run, Stop and settling actions need: core.Supervisor satisfies
-// it. Both calls block until the supervisor has an outcome (Run can take
-// several seconds), so they run only inside a command, never in Update or View.
-//
-// Settle is the settling actions' one call: a runner has to be stopped for
-// `retry` and `recover` to run, so it takes as long as the runner's last call.
-type Runners interface {
+// Control is what the palette's actions on an instance need: core.Ticker
+// satisfies it. The calls run a script and wait for it, so they run only inside
+// a command, never in Update or View.
+type Control interface {
+	// Run starts this session ticking the instance; it returns after the first tick.
 	Run(ctx context.Context, instanceKey string) (core.RunResult, error)
-	Stop(ctx context.Context, instanceKey string) (core.StopResult, error)
-	Settle(ctx context.Context, instanceKey string, req core.SettleRequest) (core.SettleResult, error)
+	// Stop ends this session's ticking at once.
+	Stop(instanceKey string) core.StopResult
+	// Retry starts the failed and interrupted deliveries' runs again, of one
+	// schedule item when item is its path.
+	Retry(ctx context.Context, instanceKey, item string) (core.RetryResult, error)
+	// SetPaused sets or lifts the instance pause.
+	SetPaused(ctx context.Context, instanceKey string, pause bool) error
 	// SetItemPaused renames one schedule item's folder to pause or unpause it.
 	SetItemPaused(ctx context.Context, instanceKey, item string, pause bool) (core.ItemResult, error)
 }
 
-// WithRunners sends the palette's Run, Stop and settling actions to r, on the
-// instance the palette was bound to. While one runs, the status line shows
-// "Running …", "Stopping …", "Retrying …" or "Recovering …" and the palette offers
-// none of them for that instance again;
-// then it shows the exact outcome. reread, if set, is told which instance was
-// acted on once the call has returned, whatever its outcome, so the view can
-// catch up with protocol status; it must return at once (Refresher.Reinspect).
-func WithRunners(r Runners, reread func(instanceKey string)) Option {
-	return func(m *Model) { m.runners, m.reread = r, reread }
+// WithControl sends the palette's actions on an instance to c, on the instance
+// the palette was bound to. While one runs, the status line shows "Running …",
+// "Stopping …", "Retrying …" and so on, and the palette offers none of them for
+// that instance again; then it shows the exact outcome. reread, if set, is told
+// which instance was acted on once the call has returned, whatever its outcome,
+// so the view can catch up with protocol status; it must return at once
+// (Refresher.Reinspect).
+func WithControl(c Control, reread func(instanceKey string)) Option {
+	return func(m *Model) { m.control, m.reread = c, reread }
 }
 
-// runnersHandler puts Run, Stop and the settling actions in front of inner.
-func runnersHandler(inner ActionHandler, r Runners, reread func(string)) ActionHandler {
+// controlHandler puts the actions on an instance in front of inner.
+func controlHandler(inner ActionHandler, c Control, reread func(string)) ActionHandler {
 	return func(req ActionRequest) tea.Cmd {
 		if !req.Action.acts() {
 			return inner(req)
@@ -55,23 +57,30 @@ func runnersHandler(inner ActionHandler, r Runners, reread func(string)) ActionH
 			if label == "" {
 				label = req.InstanceKey
 			}
-			// The supervisor ends this call itself when Quit begins.
+			// The ticker refuses a new action itself once Quit has begun.
 			ctx := context.Background()
+			var err error
 			switch {
 			case req.Action == ActionRun:
-				out, err := r.Run(ctx, req.InstanceKey)
-				res.Message, res.Err = RunText(label, out), ActionFailure(label, err)
+				var out core.RunResult
+				out, err = c.Run(ctx, req.InstanceKey)
+				res.Message = RunText(label, out)
 			case req.Action == ActionStop:
-				out, err := r.Stop(ctx, req.InstanceKey)
-				res.Message, res.Err = StopText(label, out), ActionFailure(label, err)
-			case req.Action.togglesItem():
-				out, err := r.SetItemPaused(ctx, req.InstanceKey, req.ItemPath, req.Action == ActionPauseItem)
-				res.Message, res.Err = ItemText(label, out), ActionFailure(label, err)
+				res.Message = StopText(label, c.Stop(req.InstanceKey))
+			case req.Action == ActionPause || req.Action == ActionUnpause:
+				pause := req.Action == ActionPause
+				err = c.SetPaused(ctx, req.InstanceKey, pause)
+				res.Message = PauseText(label, pause)
+			case req.Action == ActionRetry:
+				var out core.RetryResult
+				out, err = c.Retry(ctx, req.InstanceKey, req.ItemPath)
+				res.Message = RetryText(label, out)
 			default:
-				out, err := r.Settle(ctx, req.InstanceKey, core.SettleRequest{Action: core.Action(req.Action), Item: req.ItemPath})
-				res.Message, res.Err = SettleText(label, out), ActionFailure(label, err)
+				var out core.ItemResult
+				out, err = c.SetItemPaused(ctx, req.InstanceKey, req.ItemPath, req.Action == ActionPauseItem)
+				res.Message = ItemText(label, out)
 			}
-			if res.Err != nil {
+			if res.Err = ActionFailure(label, err); res.Err != nil {
 				res.Message = ""
 			}
 			if reread != nil {
@@ -85,45 +94,53 @@ func runnersHandler(inner ActionHandler, r Runners, reread func(string)) ActionH
 // RunText is the notice for a Run that returned without an error. It says
 // what happened and nothing it did not see.
 func RunText(label string, r core.RunResult) string {
-	enrolled, cleared := "", ""
-	if r.Enrolled {
-		enrolled = "enrolled for this session, "
+	switch {
+	case r.Already:
+		return label + ": already ticked by this session; nothing changed"
+	case !r.Ticked:
+		return label + ": ticking every minute; the first tick has not finished yet"
+	case r.TickErr != nil:
+		return label + ": ticking every minute; the first tick reported a problem: " + short(r.TickErr.Error(), 200)
 	}
-	if r.ClearedPause {
-		cleared = "; a pause was cleared"
-	}
-	switch r.Outcome {
-	case core.RunStarted:
-		seen := "status has not shown it running yet; checking again"
-		if r.Seen {
-			seen = "status shows it running"
-		}
-		return fmt.Sprintf("%s: %srunner started (pid %d), %s%s", label, enrolled, r.PID, seen, cleared)
-	case core.RunResumed:
-		return fmt.Sprintf("%s: resumed; the runner was already running%s", label, cleared)
-	case core.RunAlreadyRunning:
-		return label + ": already running; nothing changed"
-	}
-	return label + ": done"
+	return label + ": ticked, and ticking every minute while Easyhog runs"
 }
 
-// StopText is the notice for a Stop that returned without an error: the runner
-// has ended and the instance is released, as Quit leaves each one. A Stop that
-// needed SIGTERM, or whose `stop` reported a problem, says so, in the words of
-// core.StopResult.Why (which never carries an absolute path).
+// StopText is the notice for a Stop.
 func StopText(label string, r core.StopResult) string {
-	text := label + ": stopped and released. The runner has ended and nothing owns the instance now, so another supervisor may take it, and Run enrolls it for this session again; deliveries already pending stay pending"
-	switch {
-	case r.Terminated:
-		why := r.Why
-		if why == "" {
-			why = "the runner lingering after stop"
-		}
-		text += fmt.Sprintf(". It needed SIGTERM (%s): a consumer call the runner was waiting on, if any, stays uncertain until it is recovered", why)
-	case r.Why != "":
-		text += ". Stop reported a problem on the way (" + r.Why + ")"
+	if !r.WasTicking {
+		return label + ": this session was not ticking it; nothing changed"
 	}
-	return text
+	return label + ": stopped ticking. Runs already started go on in their own sessions, and anything else that ticks it still does"
+}
+
+// PauseText is the notice for Pause instance or Unpause instance that went through.
+func PauseText(label string, pause bool) string {
+	if pause {
+		return label + ": paused. No tick, from here or anywhere else, fires an item or starts a run until Unpause instance; runs already going carry on"
+	}
+	return label + ": unpaused. The next tick fires what is due and starts what waits"
+}
+
+// RetryText is the notice for a Retry that returned without an error: which
+// runs started again, and which were busy or had nothing to run.
+func RetryText(label string, r core.RetryResult) string {
+	var parts []string
+	if n := len(r.Started); n > 0 {
+		parts = append(parts, plural(n, "run", "runs")+" started again ("+short(strings.Join(r.Started, ", "), 120)+")")
+	}
+	if n := len(r.Busy); n > 0 {
+		parts = append(parts, "busy: nothing was started for "+short(strings.Join(r.Busy, ", "), 120)+" (its run is going, or the instance's lock was held); try again shortly")
+	}
+	if n := len(r.Gone); n > 0 {
+		parts = append(parts, "nothing to run for "+short(strings.Join(r.Gone, ", "), 120))
+	}
+	for _, f := range r.Failed {
+		parts = append(parts, "could not start "+short(f.Delivery, 60)+" ("+short(f.Err.Error(), 120)+")")
+	}
+	if len(parts) == 0 {
+		return label + ": nothing to retry"
+	}
+	return label + ": " + strings.Join(parts, "; ")
 }
 
 // ItemText is the notice for a Pause item or Unpause item that went through: which
@@ -136,52 +153,16 @@ func ItemText(label string, r core.ItemResult) string {
 	return fmt.Sprintf("%s: %s unpaused: its folder %s was renamed to %s; it fires again at its next time unless a folder above it, or the instance, is still paused", label, r.Item, from, to)
 }
 
-// SettleText is the notice for a settling action that returned without an
-// error: what was settled, and what became of the runner.
-func SettleText(label string, r core.SettleResult) string {
-	n := len(r.Settled)
-	var what string
-	switch r.Action {
-	case core.ActionRetryFailed:
-		what = fmt.Sprintf("%s set pending; the next attempt is made by the runner", plural(n, "failed delivery", "failed deliveries"))
-	case core.ActionRecoverAccept:
-		what = fmt.Sprintf("%s recorded as done on your say-so; nothing was invoked", plural(n, "uncertain delivery", "uncertain deliveries"))
-	default:
-		what = fmt.Sprintf("%s set pending to be tried again; nothing was invoked", plural(n, "uncertain delivery", "uncertain deliveries"))
-	}
-	runner := ""
-	switch {
-	case r.Restarted:
-		seen := "status has not shown it running yet; checking again"
-		if r.Seen {
-			seen = "status shows it running"
-		}
-		runner = fmt.Sprintf("; the runner was stopped and restarted (pid %d), %s", r.PID, seen)
-		if r.Paused {
-			runner += ". The instance is still paused"
-		}
-	case r.StoppedRunner:
-		runner = "; the runner was stopped and not restarted"
-	default:
-		runner = "; no runner was running, so none was started"
-	}
-	return label + ": " + what + runner
-}
-
-// ActionFailure words an error from Run, Stop or a settling action for the status line, naming
-// the instance by its relative path (never the absolute one the error carries)
-// and the reason as the supervisor gave it. A nil error gives nil.
+// ActionFailure words an error from an action for the status line, naming the
+// instance by its relative path (never the absolute one the error carries) and
+// the reason as the ticker or the script gave it. A nil error gives nil.
 func ActionFailure(label string, err error) error {
 	if err == nil {
 		return nil
 	}
 	var text string
 	var refused *core.RefusedError
-	var exited *core.RunnerExitedError
-	var unc *groundhog.UncertainEnrollError
 	var exit *groundhog.ExitError
-	var settle *core.SettleError
-	var stop *core.StopError
 	switch {
 	case errors.Is(err, core.ErrItemBusy):
 		text = label + ": nothing was renamed: another operation holds the instance's lock; try again shortly"
@@ -192,46 +173,17 @@ func ActionFailure(label string, err error) error {
 			detail = strings.TrimPrefix(detail, e.Error()+": ")
 		}
 		text = label + ": nothing was renamed: " + detail
-	case errors.As(err, &stop):
-		text = label + ": not released: " + stop.Why + ". This session still holds the instance, so Stop can be tried again"
-	case errors.As(err, &settle):
-		text = label + ": " + settleFailure(settle)
 	case errors.As(err, &refused):
 		text = label + ": refused: " + refused.Reason.String()
 		if refused.Detail != "" {
 			text += ": " + refused.Detail
 		}
-	case errors.As(err, &exited):
-		text = fmt.Sprintf("%s: the runner ended at startup (%s) and was not started again; log: %s", label, exited.Exit, exited.Log)
-	case errors.As(err, &unc):
-		text = label + ": the enroll ended without a certain outcome; the token is kept and nothing was started. The next Run, or the next status read, settles it"
 	case errors.As(err, &exit) && exit.Kind == groundhog.KindBusy:
-		text = label + ": still busy after retries (another operation holds the instance's lock); try again shortly"
+		text = label + ": busy (another writer holds the instance's lock); try again shortly"
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		text = label + ": interrupted before it finished: " + err.Error()
 	default:
 		text = label + ": failed: " + err.Error()
 	}
 	return &ActionError{Text: text, Err: err}
-}
-
-// settleFailure words a settling action that did not finish, with what became
-// of the deliveries and of the runner.
-func settleFailure(e *core.SettleError) string {
-	var b strings.Builder
-	switch e.Stage {
-	case core.SettleStopping:
-		fmt.Fprintf(&b, "could not be settled yet: the runner had not stopped after %s, so nothing was settled", e.Waited.Round(time.Second))
-	case core.SettleSettling:
-		fmt.Fprintf(&b, "settled %d of %d, then failed", e.Done, e.Total)
-	default:
-		fmt.Fprintf(&b, "settled %d of %d", e.Done, e.Total)
-	}
-	if e.Cause != nil {
-		b.WriteString(" (" + short(e.Cause.Error(), 200) + ")")
-	}
-	if e.Runner != "" {
-		b.WriteString("; " + e.Runner)
-	}
-	return b.String()
 }

@@ -219,7 +219,7 @@ func TestPaletteActionsGoThroughHandlerAndValidOnly(t *testing.T) {
 	if got := names(m); got != "Stop,Open folder,Refresh,Quit" {
 		t.Fatalf("alpha commands = %s", got)
 	}
-	m, _ = feed(m, key(tea.KeyDown)) // beta: not enrolled
+	m, _ = feed(m, key(tea.KeyDown)) // beta: not ticked
 	if got := names(m); got != "Run,Open folder,Refresh,Quit" {
 		t.Fatalf("beta commands = %s", got)
 	}
@@ -745,7 +745,7 @@ func TestStopIsFoundByItsNamePrefixAndNoAlias(t *testing.T) {
 // The glyph of Run and of Stop is its own: no row state draws it, so a command's
 // glyph never reads as a state (Stop is ■; the state stopped is ○).
 func TestRunAndStopGlyphsDifferFromEveryStateGlyph(t *testing.T) {
-	for s := StateStopped; s <= StateInconsistent; s++ {
+	for s := StateStopped; s <= StateScheduled; s++ {
 		for _, a := range []Action{ActionRun, ActionStop} {
 			for _, c := range allCommands {
 				if c.action == a && c.glyph == s.glyph() {

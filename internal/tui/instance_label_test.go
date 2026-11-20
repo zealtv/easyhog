@@ -47,7 +47,7 @@ func TestInstanceLabelNeverEmptyOrDot(t *testing.T) {
 
 func labelRig(t *testing.T, v core.InstanceView) Model {
 	t.Helper()
-	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookup(nil)))
+	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, ticks()))
 	m, _ = feed(m, tea.WindowSizeMsg{Width: 120, Height: 30})
 	return m
 }
@@ -86,7 +86,7 @@ func TestEveryPlaceTheInstanceLabelShowsDropsTheSuffix(t *testing.T) {
 // A search root that is a project, or the instance itself, still names the project.
 func TestRootThatIsAProjectOrTheInstanceShowsTheProjectName(t *testing.T) {
 	for _, display := range []string{".groundhog", "."} {
-		v := unowned("x")
+		v := supported("x")
 		v.Instance = discovery.Instance{Path: "/work/myproj/.groundhog", Display: display}
 		m := labelRig(t, v)
 		screen := ansi.Strip(m.View())
@@ -102,7 +102,7 @@ func TestRootThatIsAProjectOrTheInstanceShowsTheProjectName(t *testing.T) {
 
 // Labels stay sanitised once the suffix goes.
 func TestTrimmedLabelStaysInert(t *testing.T) {
-	v := unowned("x")
+	v := supported("x")
 	v.Instance.Display = "evil\x1b[2J\x07dir/.groundhog"
 	m := labelRig(t, v)
 	if out := m.View(); strings.Contains(out, "\x1b[2J") || strings.Contains(out, "\x07") {

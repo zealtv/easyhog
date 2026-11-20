@@ -7,9 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,91 +21,23 @@ import (
 	"github.com/zealtv/easyhog/internal/runner"
 )
 
-// The shell, the supervisor and the refresher against the pinned upstream
-// script, on a temporary instance only: the reader runs an instance from the
-// palette, the view reconciles with protocol status (running, ours), pause
-// leaves pending deliveries pending, and Quit releases. Nothing here touches
-// this repository's own .groundhog/ or any real schedule.
+// The shell, the ticker and the refresher against the pinned upstream script,
+// on a temporary instance only: the reader runs an instance from the palette,
+// a due item's run is accepted, the view reconciles with protocol status, the
+// instance pause holds it back, and Quit just stops ticking. Nothing here
+// touches this repository's own .groundhog/ or any real schedule.
 
 const (
-	pinnedScript = "../groundhog/testdata/upstream-1c68c9d/groundhog.sh"
-	pinnedSHA256 = "298c9d5d11465607796043d44c5e8dc42a20912aa52c00988505aaf8be09dbb9"
+	pinnedScript = "../groundhog/testdata/upstream-9317d4e/groundhog.sh"
+	pinnedSHA256 = "5a961d101ffc6d9186b836bd1f140c4c78e0b92770d682858a5a799d0cc562c2"
 )
 
-// reaper starts real runners and makes sure none outlives its test.
-type reaper struct {
-	mu       sync.Mutex
-	children []runner.Child
-}
-
-func (l *reaper) Start(ln runner.Launch) (runner.Child, error) {
-	c, err := runner.Spawner{}.Start(ln)
-	if err == nil {
-		l.mu.Lock()
-		l.children = append(l.children, c)
-		l.mu.Unlock()
-	}
-	return c, err
-}
-
-func (l *reaper) reapAll(t *testing.T) {
-	l.mu.Lock()
-	children := append([]runner.Child(nil), l.children...)
-	l.mu.Unlock()
-	for _, c := range children {
-		_ = c.Terminate()
-		select {
-		case <-c.Done():
-		case <-time.After(10 * time.Second):
-			t.Errorf("runner %d outlived its test", c.PID())
-		}
-	}
-}
-
-// countingLauncher counts runner starts, to show that a double Run enrolls and
-// starts once.
-type countingLauncher struct {
-	*reaper
-	mu     sync.Mutex
-	starts int
-}
-
-func (l *countingLauncher) Start(ln runner.Launch) (runner.Child, error) {
-	l.mu.Lock()
-	l.starts++
-	l.mu.Unlock()
-	return l.reaper.Start(ln)
-}
-
-func (l *countingLauncher) count() int { l.mu.Lock(); defer l.mu.Unlock(); return l.starts }
-
-// countingExec counts calls per protocol command.
-type countingExec struct {
-	runner.Executor
-	mu     sync.Mutex
-	counts map[string]int
-}
-
-func (e *countingExec) Run(ctx context.Context, inv runner.Invocation) error {
-	e.mu.Lock()
-	if e.counts == nil {
-		e.counts = map[string]int{}
-	}
-	e.counts[inv.Args[0]]++
-	e.mu.Unlock()
-	return e.Executor.Run(ctx, inv)
-}
-
-func (e *countingExec) count(cmd string) int { e.mu.Lock(); defer e.mu.Unlock(); return e.counts[cmd] }
-
 type e2e struct {
-	t        *testing.T
-	key      string
-	sup      *core.Supervisor
-	ref      *core.Refresher
-	launcher *countingLauncher
-	exec     *countingExec
-	m        Model
+	t   *testing.T
+	key string
+	tk  *core.Ticker
+	ref *core.Refresher
+	m   Model
 }
 
 func newE2E(t *testing.T) *e2e {
@@ -122,32 +54,30 @@ func newE2E(t *testing.T) *e2e {
 		t.Fatal(err)
 	}
 	inst := filepath.Join(root, "proj", ".groundhog")
-	for _, d := range []string{"schedule", "out", "fired", "runtime"} {
-		if err := os.MkdirAll(filepath.Join(inst, d), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(inst, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(inst, "groundhog.sh"), script, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A loose directory in out/ reads as a pending delivery (legacy_out,
-	// unregistered) and nothing will consume it.
-	if err := os.MkdirAll(filepath.Join(inst, "out", "waiting"), 0o755); err != nil {
+	if out, err := exec.Command(filepath.Join(inst, "groundhog.sh"), "init").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v %s", err, out)
+	}
+	// A daily item due now, whose run leaves a mark beside the instance.
+	item := filepath.Join(inst, "schedule", "daily", "hello")
+	if err := os.MkdirAll(item, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(item, "run"), []byte("#!/bin/sh\necho hello > \""+filepath.Join(root, "proj", "ran")+"\"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	exec := &countingExec{Executor: runner.Process{}}
-	launcher := &countingLauncher{reaper: &reaper{}}
-	stateDir, err := filepath.EvalSymlinks(t.TempDir())
+	clients := core.NewClients(runner.Process{})
+	tk, err := core.NewTicker(core.TickerConfig{Clients: clients})
 	if err != nil {
 		t.Fatal(err)
 	}
-	sup, err := core.NewSupervisor(core.SupervisorConfig{Exec: exec, Launcher: launcher, StateDir: stateDir, Label: "e2e-session",
-		PollEvery: 50 * time.Millisecond, BusyDelay: 100 * time.Millisecond, StartWait: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ref, err := core.NewRefresher(core.Config{Root: root, FS: discovery.OS{}, Exec: runner.Process{}, IsOurs: sup.IsOurs,
+	ref, err := core.NewRefresher(core.Config{Root: root, FS: discovery.OS{}, Exec: runner.Process{}, Clients: clients,
 		Interval: 200 * time.Millisecond, SelectSettle: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
@@ -159,26 +89,32 @@ func newE2E(t *testing.T) *e2e {
 	done := make(chan struct{})
 	go func() { defer close(done); _ = ref.Run(ctx) }()
 	t.Cleanup(func() {
-		qctx, qcancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer qcancel()
-		sup.Quit(qctx)
+		tk.Quit(context.Background())
 		cancel()
 		<-done
-		launcher.reapAll(t)
 	})
-
-	e := &e2e{t: t, key: inst, sup: sup, ref: ref, launcher: launcher, exec: exec}
-	e.m = NewWithData(e.data(), WithSelectionObserver(ref.Select), WithRefresh(ref.Refresh),
-		WithRunners(sup, ref.Reinspect))
+	e := &e2e{t: t, key: inst, tk: tk, ref: ref}
+	if sup, err := e.client().Negotiate(context.Background()); err != nil || !sup.Controllable {
+		t.Skipf("this host offers no runs: %+v %v", sup, err)
+	}
+	e.m = NewWithData(e.data(), WithSelectionObserver(ref.Select), WithRefresh(ref.Refresh), WithControl(tk, ref.Reinspect))
 	e.send(tea.WindowSizeMsg{Width: 100, Height: 30})
 	ref.Select(e.m.selectedInstance()) // stands for the reader's first key press, which reports the selection
 	return e
 }
 
-func (e *e2e) data() Data { return FromViewWith(e.ref.View(), e.sup.Runner) }
+func (e *e2e) data() Data { return FromViewWith(e.ref.View(), e.tk.Info) }
+
+func (e *e2e) client() *groundhog.Client {
+	c, err := groundhog.New(runner.Process{}, e.key)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	return c
+}
 
 // send feeds messages to the model and then every message its commands
-// produce, running the commands to completion (Run takes a moment).
+// produce, running the commands to completion (Run takes a tick).
 func (e *e2e) send(msgs ...tea.Msg) {
 	e.t.Helper()
 	for len(msgs) > 0 {
@@ -197,8 +133,7 @@ func (e *e2e) send(msgs ...tea.Msg) {
 func (e *e2e) settle(what string, cond func(core.InstanceView) bool) {
 	e.t.Helper()
 	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); time.Sleep(25 * time.Millisecond) {
-		v := e.ref.View()
-		if iv, ok := v.Find(e.key); ok && cond(iv) {
+		if iv, ok := e.ref.View().Find(e.key); ok && cond(iv) {
 			e.send(SnapshotMsg{Data: e.data()})
 			return
 		}
@@ -212,169 +147,91 @@ func (e *e2e) palette(command string) {
 	e.send(key(tea.KeyEnter))
 }
 
-func (e *e2e) status() groundhog.Status {
-	e.t.Helper()
-	c, err := groundhog.New(runner.Process{}, e.key)
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	st, err := c.Status(context.Background())
-	if err != nil {
-		e.t.Fatal(err)
-	}
-	return st
-}
+func (e *e2e) names() string { return (&rig{m: e.m}).names() }
 
-// pendingDeliveries counts pending deliveries; the fixture has no schedule
-// item, so the runner can add none, and the one it starts with is out/waiting.
-func pendingDeliveries(st groundhog.Status) int {
-	n := 0
-	for _, d := range st.Deliveries {
-		if d.State == groundhog.DeliveryPending && d.Path == "out/waiting" {
-			n++
+func delivered(state groundhog.DeliveryState) func(core.InstanceView) bool {
+	return func(iv core.InstanceView) bool {
+		if iv.Inspection.Last == nil {
+			return false
 		}
+		for _, d := range iv.Inspection.Last.Status.Deliveries {
+			if d.State == state {
+				return true
+			}
+		}
+		return false
 	}
-	return n
 }
 
-func TestEndToEndRunStopRunQuitOnATempInstance(t *testing.T) {
+func TestEndToEndRunPauseStopRunQuitOnATempInstance(t *testing.T) {
 	e := newE2E(t)
-	if sup, err := (func() (groundhog.Support, error) {
-		c, err := groundhog.New(runner.Process{}, e.key)
-		if err != nil {
-			return groundhog.Support{}, err
-		}
-		return c.Negotiate(context.Background())
-	})(); err != nil || !sup.Controllable {
-		t.Skipf("this host cannot run supervised control: %+v %v", sup, err)
-	}
 
-	// Not inspected yet: no Run. Its first status read (selection settling)
-	// makes it unowned and controllable, and Run appears.
-	if names := (&rig{m: e.m}).names(); names != "Open folder,Refresh,Quit" {
+	// Not inspected yet: nothing offered. Its first status read makes it
+	// supported, and Run appears.
+	if names := e.names(); names != "Open folder,Refresh,Quit" {
 		t.Fatalf("an uninspected instance offers %s", names)
 	}
-	e.settle("the first status read", func(iv core.InstanceView) bool { return iv.Class == core.ClassUnowned })
-	if e.m.selectedInstance() != e.key {
-		t.Fatalf("selected %q", e.m.selectedInstance())
-	}
-	if names := (&rig{m: e.m}).names(); names != "Run,Open folder,Refresh,Quit" {
+	e.settle("the first status read", func(iv core.InstanceView) bool { return iv.Class == core.ClassSupported })
+	if names := e.names(); names != "Run,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("after the first read the palette offers %s", names)
 	}
-	if n := pendingDeliveries(e.status()); n != 1 {
-		t.Fatalf("setup: %d pending deliveries", n)
-	}
 
-	// Run, from the palette: the runner starts, the notice says so, and the
-	// view reconciles with protocol status: running, ours, Pause offered.
+	// Run ticks it: the item fires and its run is accepted.
 	e.palette("run")
-	if want := "Run: proj: enrolled for this session, runner started"; !strings.HasPrefix(e.m.notice, want) || e.m.failure {
+	if want := "Run: proj: ticked, and ticking every minute"; !strings.HasPrefix(e.m.notice, want) || e.m.failure {
 		t.Fatalf("notice %q (failure %v)", e.m.notice, e.m.failure)
 	}
-	e.settle("the view to show the runner running and ours", func(iv core.InstanceView) bool {
-		return iv.Class == core.ClassOwnedBySession && iv.Inspection.Last != nil && iv.Inspection.Last.Status.Runner.State == groundhog.RunnerRunning
-	})
-	st := e.status()
-	if st.Owner == nil || st.Owner.Label != "e2e-session" || st.Runner.State != groundhog.RunnerRunning || st.Paused {
-		t.Fatalf("status after Run: %+v", st)
+	e.settle("the run to be accepted", delivered(groundhog.DeliveryAccepted))
+	if got, _ := os.ReadFile(filepath.Join(filepath.Dir(filepath.Dir(e.key)), "proj", "ran")); string(got) != "hello\n" {
+		t.Errorf("the item's run left %q", got)
 	}
-	if n := e.m.rows[0].node; n.State != StateRunning || !strings.Contains(n.Detail, "running") {
+	if n := e.m.rows[0].node; n.State != StateRunning {
 		t.Fatalf("row %v %q", n.State, n.Detail)
 	}
-	if names := (&rig{m: e.m}).names(); names != "Stop,Open folder,Refresh,Quit" {
-		t.Fatalf("running and ours: the palette offers %s", names)
+	if names := e.names(); names != "Stop,Pause instance,Open folder,Refresh,Quit" {
+		t.Fatalf("ticked here: the palette offers %s", names)
 	}
 
-	// Double invocation: a second Run (the palette no longer offers it; the
-	// supervisor, asked directly, is idempotent) enrolls and starts nothing more.
-	if res, err := e.sup.Run(context.Background(), e.key); err != nil || res.Outcome != core.RunAlreadyRunning {
-		t.Fatalf("second Run: %+v %v", res, err)
-	}
-	if e.exec.count("enroll") != 1 || e.launcher.count() != 1 {
-		t.Fatalf("enrolls %d, runner starts %d", e.exec.count("enroll"), e.launcher.count())
-	}
-
-	// Stop does what Quit does for one instance: the runner ends, the instance is
-	// released and the token goes, the pending delivery stays pending, nothing is
-	// paused, and the offer flips to Run.
-	e.palette("stop")
-	if !strings.HasPrefix(e.m.notice, "Stop: proj: stopped and released.") || e.m.failure {
+	// Pause instance, then Unpause instance, through the palette.
+	e.palette("pause in")
+	if !strings.HasPrefix(e.m.notice, "Pause instance: proj: paused.") || e.m.failure {
 		t.Fatalf("notice %q", e.m.notice)
 	}
-	e.settle("the view to show the instance released", func(iv core.InstanceView) bool {
-		return iv.Class == core.ClassUnowned && iv.Inspection.Last != nil
+	e.settle("the view to show the pause", func(iv core.InstanceView) bool {
+		return iv.Inspection.Last != nil && iv.Inspection.Last.Status.Paused
 	})
-	st = e.status()
-	if st.Owner != nil || st.Paused || st.Runner.State != groundhog.RunnerStopped || pendingDeliveries(st) != 1 {
-		t.Fatalf("status after Stop: owner %v paused %v runner %v, %d pending", st.Owner, st.Paused, st.Runner.State, pendingDeliveries(st))
+	if n := e.m.rows[0].node; n.State != StatePaused || !strings.Contains(n.Detail, "this session still ticks it") {
+		t.Fatalf("paused row %v %q", n.State, n.Detail)
 	}
-	if n := e.m.rows[0].node; n.State != StateStopped || n.State.label() != "stopped" {
-		t.Fatalf("after Stop the row is %v %q, want stopped", n.State, n.Detail)
-	}
-	if names := (&rig{m: e.m}).names(); names != "Run,Open folder,Refresh,Quit" {
-		t.Fatalf("stopped: the palette offers %s", names)
-	}
+	e.palette("unpause")
+	e.settle("the view to show it unpaused", func(iv core.InstanceView) bool {
+		return iv.Inspection.Last != nil && !iv.Inspection.Last.Status.Paused
+	})
 
-	// Run again enrols it afresh and starts a second runner.
+	// Stop ends this session's ticking; Run starts it again.
+	e.palette("stop")
+	if !strings.HasPrefix(e.m.notice, "Stop: proj: stopped ticking.") || e.m.failure {
+		t.Fatalf("notice %q", e.m.notice)
+	}
+	e.send(SnapshotMsg{Data: e.data()})
+	if n := e.m.rows[0].node; n.State != StateStopped {
+		t.Fatalf("after Stop the row is %v %q (this session's own last tick must not read external)", n.State, n.Detail)
+	}
 	e.palette("run")
-	if want := "Run: proj: enrolled for this session, runner started"; !strings.HasPrefix(e.m.notice, want) || e.m.failure {
-		t.Fatalf("notice %q (failure %v)", e.m.notice, e.m.failure)
+	if !strings.HasPrefix(e.m.notice, "Run: proj: ticked") {
+		t.Fatalf("notice %q", e.m.notice)
 	}
-	if e.launcher.count() != 2 || e.exec.count("enroll") != 2 {
-		t.Fatalf("runner starts %d, enrolls %d", e.launcher.count(), e.exec.count("enroll"))
-	}
-	e.settle("the view to show it running and ours again", func(iv core.InstanceView) bool {
-		return iv.Class == core.ClassOwnedBySession && iv.Inspection.Last != nil && iv.Inspection.Last.Status.Runner.State == groundhog.RunnerRunning
-	})
 
-	// Quit: the palette ends the shell, and the one Quit that main always runs
-	// next stops and releases.
+	// Quit: the palette ends the shell, and main then stops every loop.
 	e.send(typeText(":quit")...)
-	_, cmd := e.m.Update(key(tea.KeyEnter))
-	if !quits(cmd) {
+	if _, cmd := e.m.Update(key(tea.KeyEnter)); !quits(cmd) {
 		t.Fatal("palette Quit did not quit")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	rep := e.sup.Quit(ctx)
-	if !rep.Clean() || len(rep.Instances) != 1 || rep.Instances[0].Outcome != core.QuitReleased {
-		t.Fatalf("quit report %+v", rep)
+	began := time.Now()
+	if n := e.tk.Quit(context.Background()); n != 1 || time.Since(began) > 5*time.Second {
+		t.Fatalf("Quit stopped %d in %s", n, time.Since(began))
 	}
-	st = e.status()
-	if st.Owner != nil || st.Runner.State == groundhog.RunnerRunning {
-		t.Fatalf("status after Quit: owner %+v runner %s", st.Owner, st.Runner.State)
-	}
-	if pendingDeliveries(st) != 1 {
-		t.Fatalf("pending deliveries after Quit: %d", pendingDeliveries(st))
-	}
-}
-
-// An instance owned by someone else gets no Run, and Run typed anyway finds
-// nothing: the real script, with an owner enrolled by another client.
-func TestEndToEndAnExternalOwnerIsNeverOffered(t *testing.T) {
-	e := newE2E(t)
-	other, err := core.NewSupervisor(core.SupervisorConfig{Exec: runner.Process{}, Launcher: e.launcher, StateDir: t.TempDir(), Label: "someone-else"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { other.Quit(context.Background()) })
-	if res, err := other.Run(context.Background(), e.key); err != nil {
-		if strings.Contains(err.Error(), "controllable") {
-			t.Skip(err)
-		}
-		t.Fatalf("setup: %+v %v", res, err)
-	}
-	e.settle("the instance to read as externally owned", func(iv core.InstanceView) bool { return iv.Class == core.ClassExternal })
-	if names := (&rig{m: e.m}).names(); names != "Open folder,Refresh,Quit" {
-		t.Fatalf("an external owner's instance offers %s", names)
-	}
-	e.send(typeText(":run")...)
-	if got := e.m.filtered(); len(got) != 0 {
-		t.Fatalf("Run found: %v", got)
-	}
-	// Asked directly, the supervisor refuses too, and says why.
-	_, err = e.sup.Run(context.Background(), e.key)
-	if text := ActionFailure("proj/.groundhog", err); text == nil || !strings.HasPrefix(text.Error(), "proj/.groundhog: refused: owned by another supervisor: owner \"someone-else\" is recorded") {
-		t.Fatalf("refusal %v", text)
+	if info, _ := e.tk.Info(e.key); info.Ticking {
+		t.Error("still ticking after Quit")
 	}
 }

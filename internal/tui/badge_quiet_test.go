@@ -23,19 +23,19 @@ func TestTheBadgeLeavesOutAnEmptyItemCount(t *testing.T) {
 		return v
 	}
 	failed := groundhog.Delivery{Path: "out/a", State: groundhog.DeliveryFailed} // no schedule path: adds no item
-	running := withTick(ours("a", groundhog.RunnerRunning, false), 0, "runner")
+	running := withTick(supported("a"), 0, "runner")
 	cases := []struct {
 		name    string
 		v       core.InstanceView
 		badge   string
 		preview string
 	}{
-		{"none, nothing seen ticking it", withItems(unowned("a"), 0), "", "Schedule: 0 items"},
-		{"one, nothing seen ticking it", withItems(unowned("a"), 1), "1 item", "Schedule: 1 item"},
-		{"none, will run", withItems(running, 0), "will run", "Schedule: 0 items"},
-		{"one", withItems(running, 1), "will run · 1 item", "Schedule: 1 item"},
-		{"two", withItems(running, 2), "will run · 2 items", "Schedule: 2 items"},
-		{"none, but a failure", withDeliveries(withItems(running, 0), failed), "will run · 1 failed", "Schedule: 0 items"},
+		{"none, nothing seen ticking it", withItems(supported("a"), 0), "", "Schedule: 0 items"},
+		{"one, nothing seen ticking it", withItems(supported("a"), 1), "1 item", "Schedule: 1 item"},
+		{"none, running", withItems(running, 0), "", "Schedule: 0 items"},
+		{"one", withItems(running, 1), "1 item", "Schedule: 1 item"},
+		{"two", withItems(running, 2), "2 items", "Schedule: 2 items"},
+		{"none, but a failure", withDeliveries(withItems(running, 0), failed), "1 failed", "Schedule: 0 items"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

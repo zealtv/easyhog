@@ -9,6 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/zealtv/easyhog/internal/core"
+	"github.com/zealtv/easyhog/internal/groundhog"
 )
 
 // State says what an instance or schedule item is doing, in words and a glyph
@@ -24,13 +25,9 @@ const (
 	StatePending
 	StateFailed
 	// StateScheduled is a schedule item with nothing waiting and nothing wrong: it
-	// is on the schedule. StatePending is left to what is waiting for a hand-over
-	// (a delivery), so the two words never mean each other.
+	// is on the schedule. StatePending is left to a delivery whose run waits to
+	// start, so the two words never mean each other.
 	StateScheduled
-	// StateInconsistent is an instance whose latest status read the script itself
-	// called incoherent: shown as seen, not acted on. It once read "pending", a word
-	// now left to a delivery waiting.
-	StateInconsistent
 )
 
 func (s State) label() string {
@@ -49,8 +46,6 @@ func (s State) label() string {
 		return "failed"
 	case StateScheduled:
 		return "scheduled"
-	case StateInconsistent:
-		return "inconsistent"
 	}
 	return "stopped"
 }
@@ -73,12 +68,31 @@ func (s State) glyph() string {
 		// A circle with one quadrant lit, like a clock face at three: it says "at a
 		// time", and differs from pending's dotted ◌ and from paused's half-filled ◐.
 		return "◷"
-	case StateInconsistent:
-		// Two waves: the read wavers. Unlike any other state's glyph, and the badge
-		// already says "inconsistent" in words.
-		return "≈"
 	}
 	return "○"
+}
+
+// deliveryGlyph is the mark before a delivery's state word in the preview, one
+// per state Groundhog reports, so each reads with colour off: pending, running
+// and failed share the item row's glyphs for the same thing, the rest are their own.
+func deliveryGlyph(s groundhog.DeliveryState) string {
+	switch s {
+	case groundhog.DeliveryDelivered:
+		return "→"
+	case groundhog.DeliveryPending:
+		return StatePending.glyph()
+	case groundhog.DeliveryRunning:
+		return StateRunning.glyph()
+	case groundhog.DeliveryInterrupted:
+		return "↯"
+	case groundhog.DeliveryAccepted:
+		return "✓"
+	case groundhog.DeliveryFailed:
+		return StateFailed.glyph()
+	case groundhog.DeliveryUnrecorded:
+		return "?"
+	}
+	return "∗"
 }
 
 // heartbeatGlyph is the mark after a driven row's state word, one cell wide and
@@ -106,14 +120,16 @@ type Action string
 const (
 	ActionRun  Action = "run"
 	ActionStop Action = "stop"
-	// The three settling actions are Retry failed, Recover as done and Recover and
-	// retry (core's ActionRetryFailed, ActionRecoverAccept, ActionRecoverRetry).
-	ActionRetryFailed   Action = "retry-failed"
-	ActionRecoverAccept Action = "recover-accept"
-	ActionRecoverRetry  Action = "recover-retry"
+	// Pause instance and Unpause instance set and lift the instance pause
+	// (Groundhog's tokenless `pause` and `resume`), core's ActionPause and
+	// ActionUnpause.
+	ActionPause   Action = "pause"
+	ActionUnpause Action = "unpause"
+	// Retry starts the run of the selected node's failed and interrupted
+	// deliveries again (core's ActionRetry): on an item, that item's only.
+	ActionRetry Action = "retry"
 	// Pause item and Unpause item rename one schedule item's folder (core.RenameItem).
-	// They are an item's own offers, like the settling actions, and run on the
-	// instance's one slot.
+	// They are an item's own offers, like Retry on an item.
 	ActionPauseItem   Action = "pause-item"
 	ActionUnpauseItem Action = "unpause-item"
 	ActionRefresh     Action = "refresh"
@@ -124,23 +140,20 @@ const (
 	ActionToggleHidden Action = "toggle-hidden"
 )
 
-// settles reports whether a is one of the three settling actions.
-func (a Action) settles() bool {
-	return a == ActionRetryFailed || a == ActionRecoverAccept || a == ActionRecoverRetry
-}
-
 // togglesItem reports whether a is Pause item or Unpause item.
 func (a Action) togglesItem() bool { return a == ActionPauseItem || a == ActionUnpauseItem }
 
-// onNode reports whether a is an offer of the selected node itself (an item's
-// settling actions, Pause item, Unpause item) rather than of its instance.
-func (a Action) onNode() bool { return a.settles() || a.togglesItem() }
+// onNode reports whether a is an offer of the selected node itself (Retry,
+// Pause item, Unpause item) rather than of its instance.
+func (a Action) onNode() bool { return a == ActionRetry || a.togglesItem() }
 
-// acts reports whether a asks the supervisor to do something to the instance's
-// runner, deliveries or schedule: Run, Stop, a settling action, Pause item or
-// Unpause item. They run one at a time per instance, off the update loop, and
-// show a transitional state.
-func (a Action) acts() bool { return a == ActionRun || a == ActionStop || a.onNode() }
+// acts reports whether a asks the ticker to do something to the instance, its
+// deliveries or its schedule: Run, Stop, Pause and Unpause instance, Retry,
+// Pause item or Unpause item. They run one at a time per instance, off the
+// update loop, and show a transitional state.
+func (a Action) acts() bool {
+	return a == ActionRun || a == ActionStop || a == ActionPause || a == ActionUnpause || a.onNode()
+}
 
 // Node is one row of the tree: an instance (top level) or one of its schedule
 // items.
@@ -158,9 +171,9 @@ type Node struct {
 	Preview string
 	// Actions lists the actions currently valid for an instance. The palette
 	// offers only these (plus Refresh and Quit). Items take their instance's
-	// Run and Stop, which act on the instance; the settling actions an item
-	// lists are its own (the instance's, limited to that item's deliveries), so a
-	// settling action is read from the selected node and the rest from its instance.
+	// Run, Stop and pause, which act on the instance; the Retry an item lists is
+	// its own (limited to that item's deliveries), so Retry and the item toggles
+	// are read from the selected node and the rest from its instance.
 	Actions []Action
 	// Badge is a short quiet summary drawn beside the label in the tree when the
 	// pane is wide enough ("2 items · 1 failed"). Plain text, no layout.
@@ -174,17 +187,8 @@ type Node struct {
 	// the rows something drives (external, and running here) that record a tick,
 	// and drawn as a small mark after the state word. Zero draws nothing.
 	Heartbeat core.Heartbeat
-	// RunNote is a light, non-blocking hint shown beside Run in the palette
-	// ("will settle an interrupted journal write"). It asks nothing and changes
-	// no key.
-	RunNote string
-	// RunConfirm, when set, is the question the palette puts to the reader before
-	// it runs Run on this instance: something outside Easyhog ticks it, and
-	// enrolling makes those ticks fail until Stop releases it. Empty for every
-	// instance Run can take without asking.
-	RunConfirm string
-	// ActionNotes are light hints beside the settling actions in the palette
-	// ("2 failed", "1 uncertain"), for the node the palette is bound to.
+	// ActionNotes are light hints beside an action in the palette ("2 to retry",
+	// "→ job.paused"), for the node the palette is bound to.
 	ActionNotes map[Action]string
 	// Hidden marks a top-level instance the tree leaves out unless the reader
 	// asked to see hidden instances (the palette's toggle). Hiding is only a view
@@ -198,10 +202,13 @@ type Node struct {
 }
 
 // PayloadRef names a schedule item's directory: Rel is slash-separated and
-// relative to Instance, the instance directory.
+// relative to Instance, the instance directory. Logs are the run logs of the
+// item's deliveries, newest first, as status names them
+// ("out/<name>/.groundhog-log"); the reader shows the first few as text.
 type PayloadRef struct {
 	Instance string
 	Rel      string
+	Logs     []string
 }
 
 // PayloadMsg delivers the text read for one node. It applies only while that
@@ -235,12 +242,12 @@ type ActionRequest struct {
 	// nothing is selected. NodeKey is the selected node itself.
 	InstanceKey string
 	NodeKey     string
-	// ItemPath is the schedule item's path ("schedule/daily/x") when a settling
-	// action was chosen on an item, so it settles that item's deliveries only, and
-	// for Pause item and Unpause item, the folder to rename (as the status lists it,
+	// ItemPath is the schedule item's path ("schedule/daily/x") when Retry was
+	// chosen on an item, so it retries that item's deliveries only, and for Pause
+	// item and Unpause item, the folder to rename (as the status lists it,
 	// `.paused` suffix and all); empty on an instance (all of its deliveries) and
-	// for every other action. A settling action's path has no `.paused` suffix on
-	// the item's own component, as the delivery records carry it.
+	// for every other action. Retry's path has no `.paused` suffix on the item's
+	// own component, as the delivery records carry it.
 	ItemPath string
 	// Label is the bound instance's relative path as the tree shows it, cleaned
 	// for display: what a notice about the action names.

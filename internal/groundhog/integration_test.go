@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -20,12 +19,12 @@ import (
 )
 
 // Integration tests against a pinned copy of the real upstream script, in
-// temporary instances only. They never run `tick` or `run` and never touch this
-// repository's own .groundhog/.
+// temporary instances only. They never run the script's `run` loop and never
+// touch this repository's own .groundhog/.
 
 const (
-	pinnedScript = "testdata/upstream-1c68c9d/groundhog.sh"
-	pinnedSHA256 = "298c9d5d11465607796043d44c5e8dc42a20912aa52c00988505aaf8be09dbb9"
+	pinnedScript = "testdata/upstream-9317d4e/groundhog.sh"
+	pinnedSHA256 = "5a961d101ffc6d9186b836bd1f140c4c78e0b92770d682858a5a799d0cc562c2"
 )
 
 func needShell(t *testing.T) {
@@ -88,7 +87,7 @@ func controllableClient(t *testing.T, inst string) *Client {
 		t.Fatal(err)
 	}
 	if !sup.Controllable {
-		t.Skipf("this host cannot run supervised control: %s", sup)
+		t.Skipf("this host offers no runs (no lock helper): %s", sup)
 	}
 	return c
 }
@@ -117,34 +116,6 @@ func tree(t *testing.T, dir string) string {
 	return strings.Join(lines, "\n")
 }
 
-func privateDir(t *testing.T) string {
-	t.Helper()
-	dir := filepath.Join(t.TempDir(), "session dir")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return dir
-}
-
-type tokenMeta struct {
-	Instance   string `json:"instance"`
-	OwnerID    string `json:"owner_id"`
-	Generation int64  `json:"generation"`
-}
-
-func readTokenMeta(t *testing.T, path string) tokenMeta {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var m tokenMeta
-	if err := json.Unmarshal(b, &m); err != nil {
-		t.Fatal(err)
-	}
-	return m
-}
-
 func TestRealScriptNegotiatesAndInspectsReadOnly(t *testing.T) {
 	inst := upstreamInstance(t)
 	c := realClient(t, inst)
@@ -163,13 +134,8 @@ func TestRealScriptNegotiatesAndInspectsReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if caps.Protocol != Protocol || caps.ProtocolVersion != 1 || !caps.Has(CapStatusJSON) {
+	if caps.Protocol != Protocol || caps.ProtocolVersion != 2 || !caps.Has(CapStatusJSON) || !caps.Has(CapNextDue) {
 		t.Errorf("%+v", caps)
-	}
-	// The pinned script offers both optional capabilities Quit and the status
-	// reads negotiate (since Groundhog f189ad2).
-	if !caps.Has(CapStatusActive) || !caps.Has(CapReleaseUnresolved) {
-		t.Errorf("optional capabilities missing from %v", caps.Capabilities)
 	}
 	sup, err := c.Negotiate(ctx)
 	if err != nil || !sup.Inspectable {
@@ -179,21 +145,15 @@ func TestRealScriptNegotiatesAndInspectsReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Instance != inst || st.Revision != 0 || st.JournalGeneration == nil || *st.JournalGeneration != 0 || !st.Consistent || st.Paused || st.Owner != nil || st.Runner.State != RunnerStopped {
+	if st.Instance != inst || st.ProtocolVersion != 2 || st.Paused || st.LastTick != nil {
 		t.Errorf("%+v", st)
-	}
-	if st.Consumer.Configured || !st.Consumer.Valid {
-		t.Errorf("consumer: %+v", st.Consumer)
-	}
-	// Negotiated, so the read asked for --active: the settled counts are there.
-	if st.Settled == nil || st.Settled.Accepted != 0 || st.Settled.Missing != 0 {
-		t.Errorf("settled %+v: the client should have passed --active to a script that offers it", st.Settled)
 	}
 	if len(st.Schedule) != 1 || st.Schedule[0].Path != "schedule/daily/nudge" || st.Schedule[0].ItemID != "nudge" || st.Schedule[0].Cadence == nil || st.Schedule[0].Cadence.Axis != "daily" {
 		t.Errorf("schedule: %+v", st.Schedule)
 	}
-	if len(st.Deliveries) != 1 || st.Deliveries[0].ID != nil || st.Deliveries[0].Origin != "legacy_out" || st.Deliveries[0].State != DeliveryPending ||
-		st.Deliveries[0].Reason == nil || *st.Deliveries[0].Reason != "unregistered" || st.Deliveries[0].Path != "out/loose entry" {
+	// Put in out/ by hand: no record Groundhog made, so it never runs.
+	if len(st.Deliveries) != 1 || st.Deliveries[0].ID != nil || st.Deliveries[0].State != DeliveryUnrecorded || st.Deliveries[0].Run ||
+		st.Deliveries[0].Path != "out/loose entry" {
 		t.Errorf("deliveries: %+v", st.Deliveries)
 	}
 	if after := tree(t, inst); after != before {
@@ -218,97 +178,116 @@ func TestRealScriptIdentityMismatchThroughSymlink(t *testing.T) {
 	}
 }
 
-func TestRealScriptControlLifecycle(t *testing.T) {
-	inst := upstreamInstance(t)
-	c := controllableClient(t, inst)
-	ctx := context.Background()
-	dir := privateDir(t)
-	tok := filepath.Join(dir, "owner token")
+// writeItem makes a schedule item at rel (under schedule/) whose executable run
+// has the given shell body.
+func writeItem(t *testing.T, inst, rel, body string) {
+	t.Helper()
+	dir := filepath.Join(inst, "schedule", filepath.FromSlash(rel))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "run"), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	status := func() Status {
-		t.Helper()
-		st, err := c.Status(ctx)
+// deliveryOf waits for the delivery fired from schedule path sp to reach a
+// state for which done holds, and returns it.
+func deliveryOf(t *testing.T, c *Client, sp string, done func(DeliveryState) bool) Delivery {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		st, err := c.Status(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
-		return st
+		for _, d := range st.Deliveries {
+			if d.SchedulePath != nil && *d.SchedulePath == sp && done(d.State) {
+				return d
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no delivery of %s reached the state wanted: %+v", sp, st.Deliveries)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func is(s DeliveryState) func(DeliveryState) bool {
+	return func(x DeliveryState) bool { return x == s }
+}
+
+// The whole of protocol 2 that Easyhog drives, on the real script: a tick fires
+// due items and starts their runs, a failing run reads failed, retry runs it
+// again (and says busy while it runs), and the instance pause holds firings and
+// retries back.
+func TestRealScriptTicksRetriesAndPauses(t *testing.T) {
+	inst := upstreamInstance(t)
+	c := controllableClient(t, inst)
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Join(inst, "runtime"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gate := filepath.Join(filepath.Dir(inst), "gate")
+	writeItem(t, inst, "daily/ok", `echo "ran $1"`)
+	// Fails the first time; later attempts wait for the gate file, then succeed.
+	writeItem(t, inst, "daily/flaky", `if [ -e "$1/tried" ]; then while [ ! -e "`+gate+`" ]; do sleep 0.05; done; exit 0; fi; : > "$1/tried"; exit 3`)
+
+	if err := c.Tick(ctx); err != nil {
+		t.Fatal(err)
+	}
+	okDel := deliveryOf(t, c, "schedule/daily/ok", is(DeliveryAccepted))
+	if !okDel.Run || len(okDel.Attempts) != 1 || okDel.Attempts[0].By != "tick" || okDel.Log == nil {
+		t.Errorf("accepted delivery: %+v", okDel)
+	}
+	flaky := deliveryOf(t, c, "schedule/daily/flaky", is(DeliveryFailed))
+	if flaky.ExitStatus == nil || *flaky.ExitStatus != 3 {
+		t.Errorf("failed delivery: %+v", flaky)
+	}
+	st, _ := c.Status(ctx)
+	if st.LastTick == nil || st.LastTick.Source != "standalone" {
+		t.Errorf("last_tick after a tick: %+v", st.LastTick)
 	}
 
-	if err := c.Enroll(ctx, "test session", tok); err != nil {
+	// Retry runs it again; while that attempt runs, a second retry is busy.
+	if err := c.Retry(ctx, flaky.Path); err != nil {
 		t.Fatal(err)
 	}
-	meta := readTokenMeta(t, tok)
-	st := status()
-	if st.Owner == nil || st.Owner.ID != meta.OwnerID || st.Owner.Generation != meta.Generation || meta.Instance != inst || st.Owner.Label != "test session" {
-		t.Fatalf("owner %+v does not match the token's metadata %+v", st.Owner, meta)
+	running := deliveryOf(t, c, "schedule/daily/flaky", is(DeliveryRunning))
+	if len(running.Attempts) != 2 || running.Attempts[1].By != "retry" {
+		t.Errorf("running delivery: %+v", running)
 	}
-	if info, err := os.Stat(tok); err != nil || info.Mode().Perm() != 0o600 {
-		t.Errorf("token file: %v %v", info, err)
+	assertKind(t, c.Retry(ctx, flaky.Path), KindBusy, 4)
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	rev := st.Revision
-	if rev == 0 {
-		t.Error("enroll left the revision at 0")
-	}
+	deliveryOf(t, c, "schedule/daily/flaky", is(DeliveryAccepted))
 
-	if err := c.Pause(ctx, tok); err != nil {
+	// A delivery without a run, and a path that is no delivery here.
+	if err := os.MkdirAll(filepath.Join(inst, "out", "by hand"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	st = status()
-	if !st.Paused || st.Revision <= rev {
-		t.Errorf("after pause: paused=%v revision %d (was %d)", st.Paused, st.Revision, rev)
-	}
-	rev = st.Revision
-	if err := c.Pause(ctx, tok); err != nil { // idempotent
-		t.Fatal(err)
-	}
-	if err := c.Resume(ctx, tok); err != nil {
-		t.Fatal(err)
-	}
-	if st = status(); st.Paused || st.Revision <= rev {
-		t.Errorf("after resume: paused=%v revision %d", st.Paused, st.Revision)
-	}
-	if err := c.Pause(ctx, tok); err != nil {
-		t.Fatal(err)
-	}
+	assertKind(t, c.Retry(ctx, "out/by hand"), KindNothing, 5)
+	assertKind(t, c.Retry(ctx, "out/nothing here"), KindInvalid, 2)
 
-	// No runner is live, so stop returns at once and keeps ownership.
-	if err := c.Stop(ctx, tok, WithTimeout(20*time.Second)); err != nil {
+	// The instance pause: idempotent, shown in status, and retry is refused.
+	for range 2 {
+		if err := c.Pause(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st, _ := c.Status(ctx); !st.Paused {
+		t.Error("pause did not show in status")
+	}
+	assertKind(t, c.Retry(ctx, okDel.Path), KindPaused, 3)
+	if err := c.Tick(ctx); err != nil { // a paused tick exits 0 and fires nothing
+		t.Fatalf("a paused tick: %v", err)
+	}
+	if err := c.Resume(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if st = status(); st.Owner == nil || st.Runner.State != RunnerStopped {
-		t.Errorf("after stop: %+v", st)
-	}
-
-	// A second enroll on an owned instance is an ownership conflict, certain.
-	err := c.Enroll(ctx, "rival", filepath.Join(dir, "rival token"))
-	assertKind(t, err, KindOwnership, 3)
-	if errors.Is(err, ErrEnrollUncertain) {
-		t.Error("a refused enroll was reported uncertain")
-	}
-
-	if err := c.Release(ctx, tok); err != nil {
-		t.Fatal(err)
-	}
-	st = status()
-	if st.Owner != nil || !st.Paused {
-		t.Errorf("release must end ownership and keep the pause: %+v", st)
-	}
-
-	// The released token is stale now.
-	assertKind(t, c.Pause(ctx, tok), KindOwnership, 3)
-	assertKind(t, c.Stop(ctx, tok), KindOwnership, 3)
-	assertKind(t, c.Release(ctx, tok), KindOwnership, 3)
-
-	// Re-enrollment advances the generation.
-	tok2 := filepath.Join(dir, "second token")
-	if err := c.Enroll(ctx, "again", tok2); err != nil {
-		t.Fatal(err)
-	}
-	if m := readTokenMeta(t, tok2); m.Generation != meta.Generation+1 || status().Owner.Generation != m.Generation {
-		t.Errorf("generation did not advance: %+v after %+v", m, meta)
-	}
-	if err := c.Release(ctx, tok2); err != nil {
-		t.Fatal(err)
+	if st, _ := c.Status(ctx); st.Paused {
+		t.Error("resume did not show in status")
 	}
 }
 
@@ -324,44 +303,31 @@ func assertKind(t *testing.T, err error, kind Kind, code int) {
 	}
 }
 
-func TestRealScriptTokenFileErrors(t *testing.T) {
-	inst := upstreamInstance(t)
-	c := controllableClient(t, inst)
+// An older Groundhog (protocol 1) is shown read-only with a plain reason, and
+// nothing that changes an instance is ever asked of it.
+func TestProtocol1ScriptIsReadOnlyAndUntouched(t *testing.T) {
+	needShell(t)
+	caps := `{"protocol":"groundhog-runtime","protocol_version":1,"capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]}`
+	script := []byte("#!/bin/sh\ncase \"$1\" in\ncapabilities) echo '" + caps + "';;\n*) echo ran >> \"$(dirname \"$0\")/ran\"; exit 9;;\nesac\n")
+	inst := newInstance(t, script)
+	c := realClient(t, inst)
 	ctx := context.Background()
-	dir := privateDir(t)
-
-	// A missing and a malformed token file are exit 2.
-	assertKind(t, c.Pause(ctx, filepath.Join(dir, "missing")), KindInvalid, 2)
-	bad := filepath.Join(dir, "bad")
-	if err := os.WriteFile(bad, []byte("{not json"), 0o600); err != nil {
+	sup, err := c.Negotiate(ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	assertKind(t, c.Resume(ctx, bad), KindInvalid, 2)
-
-	// Enroll onto an existing file: exit 2, no ownership.
-	err := c.Enroll(ctx, "demo", bad)
-	assertKind(t, err, KindInvalid, 2)
-	if errors.Is(err, ErrEnrollUncertain) {
-		t.Error("exit 2 is a certain failure")
+	if sup.Controllable || sup.Inspectable || !strings.Contains(sup.Reason, "older Groundhog") {
+		t.Errorf("%+v", sup)
 	}
-	if st, err := c.Status(context.Background()); err != nil || st.Owner != nil {
-		t.Errorf("a failed enroll left an owner: %+v %v", st.Owner, err)
+	for name, err := range map[string]error{
+		"tick": c.Tick(ctx), "retry": c.Retry(ctx, "out/x"), "pause": c.Pause(ctx), "resume": c.Resume(ctx),
+	} {
+		if !errors.Is(err, ErrUnsupported) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-
-	// An unwritable token directory fails before any owner commit: exit 6.
-	if os.Geteuid() != 0 {
-		ro := filepath.Join(dir, "ro")
-		if err := os.Mkdir(ro, 0o500); err != nil {
-			t.Fatal(err)
-		}
-		err := c.Enroll(ctx, "demo", filepath.Join(ro, "token"))
-		assertKind(t, err, KindIO, 6)
-		if errors.Is(err, ErrEnrollUncertain) {
-			t.Error("exit 6 guarantees failure before the owner commit")
-		}
-		if st, _ := c.Status(ctx); st.Owner != nil {
-			t.Error("exit 6 left an owner")
-		}
+	if _, err := os.Stat(filepath.Join(inst, "ran")); err == nil {
+		t.Error("a command other than capabilities ran")
 	}
 }
 
@@ -380,20 +346,12 @@ func TestLegacyScriptIsReadOnlyAndUntouched(t *testing.T) {
 	if sup.Controllable || sup.Inspectable || !sup.ReadOnly() || !strings.Contains(sup.Reason, "legacy") || !strings.Contains(sup.Reason, "unknown command") {
 		t.Errorf("%+v", sup)
 	}
-	tok := filepath.Join(privateDir(t), "token")
 	for name, err := range map[string]error{
-		"enroll":  c.Enroll(ctx, "demo", tok),
-		"pause":   c.Pause(ctx, tok),
-		"resume":  c.Resume(ctx, tok),
-		"stop":    c.Stop(ctx, tok),
-		"release": c.Release(ctx, tok),
+		"tick": c.Tick(ctx), "retry": c.Retry(ctx, "out/x"), "pause": c.Pause(ctx), "resume": c.Resume(ctx),
 	} {
 		if !errors.Is(err, ErrUnsupported) {
 			t.Errorf("%s: %v", name, err)
 		}
-	}
-	if _, err := os.Stat(tok); err == nil {
-		t.Error("a token file appeared")
 	}
 	if after := tree(t, inst); after != before {
 		t.Errorf("the legacy instance changed:\n%s\n--- became ---\n%s", before, after)
@@ -419,13 +377,12 @@ func TestRealProcessTimeoutAndOutputBounds(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 10*time.Second {
 		t.Fatalf("status did not time out promptly: %v after %v", err, time.Since(start))
 	}
-	// A timed-out enroll is uncertain, never failed.
-	tok := filepath.Join(privateDir(t), "token")
+	// A hung tick is cut off at its bound, its outcome unknown.
 	start = time.Now()
-	err = c.Enroll(ctx, "demo", tok, WithTimeout(300*time.Millisecond))
-	var ue *UncertainEnrollError
-	if !errors.As(err, &ue) || !errors.Is(err, ErrEnrollUncertain) || ue.TokenFile != tok || time.Since(start) > 10*time.Second {
-		t.Fatalf("enroll timeout: %v after %v", err, time.Since(start))
+	err = c.Tick(ctx, WithTimeout(300*time.Millisecond))
+	var ce *CallError
+	if !errors.As(err, &ce) || !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 10*time.Second {
+		t.Fatalf("tick timeout: %v after %v", err, time.Since(start))
 	}
 
 	flood := newInstance(t, []byte("#!/bin/sh\nexec yes\n"))
@@ -440,9 +397,9 @@ func TestRealProcessTimeoutAndOutputBounds(t *testing.T) {
 	if sup, err := nc.Negotiate(ctx); err != nil || !sup.Controllable {
 		t.Fatalf("%+v %v", sup, err)
 	}
-	err = nc.Pause(ctx, tok)
+	err = nc.Pause(ctx)
 	var ee *ExitError
-	if !errors.As(err, &ee) || ee.Kind != KindState || ee.Code != 5 {
+	if !errors.As(err, &ee) || ee.Kind != KindNothing || ee.Code != 5 {
 		t.Fatalf("%v", err)
 	}
 	if len(ee.Stderr) > DefaultMaxStderr || !ee.StderrTruncated || !strings.HasPrefix(ee.Stderr, "error: first line") || len(err.Error()) > 600 {

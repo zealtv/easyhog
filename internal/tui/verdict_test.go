@@ -21,28 +21,31 @@ func withTick(v core.InstanceView, age time.Duration, source string) core.Instan
 	return v
 }
 
-func TestVerdictShowsInTheBadgeAndThePreview(t *testing.T) {
+// The row's badge leaves the verdict out (the state word and its glyph say
+// it; Bob, 2026-11-19) and the preview keeps it whole, with its reasons.
+func TestVerdictStaysOutOfTheBadgeAndInThePreview(t *testing.T) {
 	cases := []struct {
 		name    string
 		v       core.InstanceView
+		info    *core.TickInfo
 		badge   string
 		preview string
 	}{
-		{"running here", withTick(ours("a", groundhog.RunnerRunning, false), 12*time.Second, "runner"),
-			"will run", "Pending work: yes, this session's runner ticked 12s before the"},
-		{"paused", withTick(ours("a", groundhog.RunnerRunning, true), 12*time.Second, "runner"),
-			"paused: won't run", "Pending work: no, the instance is paused."},
-		{"something else ticked", withTick(unowned("a"), 45*time.Second, "standalone"),
-			"probably", "Pending work: probably, something outside Easyhog ticked it 45s before the"},
-		{"old tick", withTick(unowned("a"), 25*time.Minute, "standalone"),
+		{"ticked here", withTick(supported("a"), 12*time.Second, "standalone"), here(0),
+			"", "Pending work: yes, this session ticks it; last tick 12s before the"},
+		{"paused", withTick(pausedInstance("a"), 12*time.Second, "standalone"), here(0),
+			"", "Pending work: no, the instance is paused."},
+		{"something else ticked", withTick(supported("a"), 45*time.Second, "standalone"), nil,
+			"", "Pending work: probably, something outside Easyhog ticked it 45s before the"},
+		{"old tick", withTick(supported("a"), 25*time.Minute, "standalone"), nil,
 			"", "Pending work: nothing seen ticking it; last tick 25m00s before the"},
-		{"never recorded", unowned("a"),
+		{"never recorded", supported("a"), nil,
 			"", "Pending work: nothing seen ticking it; no tick recorded."},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			n := instanceNode(c.v, nil, false)
-			if n.Badge != c.badge { // these instances have no items, so the verdict is the whole badge
+			n := instanceNode(c.v, c.info, false)
+			if n.Badge != c.badge { // these instances have no items or deliveries, so nothing else is left in the badge
 				t.Errorf("badge %q, want %q", n.Badge, c.badge)
 			}
 			if !strings.Contains(n.Preview, c.preview) {
@@ -59,40 +62,28 @@ func TestNoVerdictWithoutAStatus(t *testing.T) {
 	}
 }
 
-func TestVerdictOutlastsTheItemCountsInANarrowTree(t *testing.T) {
-	d := FromView(core.View{Instances: []core.InstanceView{withTick(unowned("alpha"), 45*time.Second, "standalone")}})
-	m := NewWithData(d)
+// The counts give way before the state word in a narrow tree.
+func TestCountsGiveWayInANarrowTree(t *testing.T) {
+	v := withTick(withDeliveries(supported("alpha"), delivery("out/f", groundhog.DeliveryFailed, ""), delivery("out/p", groundhog.DeliveryPending, "")), 45*time.Second, "standalone")
+	m := NewWithData(FromView(core.View{Instances: []core.InstanceView{v}}))
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 30})
-	row := ansi.Strip(next.(Model).treeRow(0, 56))
-	if !strings.Contains(row, "probably") || strings.Contains(row, "45s") {
-		t.Errorf("row %q", row)
+	if row := ansi.Strip(next.(Model).treeRow(0, 80)); !strings.Contains(row, "1 pending · 1 failed") {
+		t.Errorf("wide row %q", row)
 	}
-	if strings.Contains(row, "pending") {
-		t.Errorf("the counts should go first: %q", row)
+	row := ansi.Strip(next.(Model).treeRow(0, 30))
+	if !strings.Contains(row, "failed") || strings.Contains(row, "pending") || strings.Contains(row, "45s") {
+		t.Errorf("narrow row %q", row)
 	}
 }
 
-// An unowned instance whose status is incoherent only for an unfinished journal
-// write offers Run, and the palette says Run will settle it.
-func TestRunNoteForAnInterruptedJournalWrite(t *testing.T) {
-	st := okStatus()
-	st.Consistent = false
-	st.Diagnostics = []groundhog.Problem{{Code: "journal_write_in_progress"}}
-	v := iv("alpha", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(st), Attempts: 3})
-	if got := actionsOf(t, v, nil); got != "run" {
-		t.Fatalf("actions %q", got)
-	}
-	r := newRig(t, &fakeRunners{})
-	r.m = NewWithData(r.data(v), WithRunners(&fakeRunners{}, func(string) {}))
-	r.send(tea.WindowSizeMsg{Width: 110, Height: 30})
-	r.send(typeText(":")...)
-	if s := r.screen(); !strings.Contains(s, "will settle an interrupted journal write") {
-		t.Fatalf("no hint beside Run:\n%s", s)
-	}
-	// Another incoherence keeps today's refusal.
-	st.Diagnostics = append(st.Diagnostics, groundhog.Problem{Code: "delivery_record_malformed"})
-	v = iv("alpha", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(st), Attempts: 3})
-	if got := actionsOf(t, v, nil); got != "" {
-		t.Errorf("actions %q", got)
+// The script reports UTC; the verdict line gives the read's time in the zone
+// the preview's other times use, so it sits beside "inspected" in one clock.
+func TestVerdictTimeIsInThePreviewsZone(t *testing.T) {
+	zone := time.FixedZone("UTC+11", 11*3600)
+	v := withTick(supported("a"), 12*time.Second, "standalone")
+	v.Inspection.Last.TakenAt = at.In(zone)
+	n := instanceNode(v, nil, false)
+	if !strings.Contains(n.Preview, "12s before the 20:30:15 read") || !strings.Contains(n.Detail, "inspected 20:30:15") {
+		t.Errorf("detail %q\n%s", n.Detail, n.Preview)
 	}
 }

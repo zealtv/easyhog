@@ -3,15 +3,13 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -21,14 +19,14 @@ import (
 )
 
 const (
-	pinnedScript = "../../internal/groundhog/testdata/upstream-1c68c9d/groundhog.sh"
-	pinnedSHA256 = "298c9d5d11465607796043d44c5e8dc42a20912aa52c00988505aaf8be09dbb9"
+	pinnedScript = "../../internal/groundhog/testdata/upstream-9317d4e/groundhog.sh"
+	pinnedSHA256 = "5a961d101ffc6d9186b836bd1f140c4c78e0b92770d682858a5a799d0cc562c2"
 )
 
-// Whatever ends the terminal, main runs shutdown, which says what it is doing
-// while it waits and then releases what this session enrolled. A temporary
-// instance and the pinned script only.
-func TestShutdownTellsTheReaderItIsStoppingRunnersAndReleasesThem(t *testing.T) {
+// Whatever ends the terminal, main runs shutdown, which stops ticking at once:
+// a run still going is not waited for, signalled or released, and finishes on
+// its own afterwards. A temporary instance and the pinned script only.
+func TestShutdownStopsTickingAndLeavesARunThatIsStillGoingToFinish(t *testing.T) {
 	script, err := os.ReadFile(pinnedScript)
 	if err != nil {
 		t.Fatal(err)
@@ -41,164 +39,87 @@ func TestShutdownTellsTheReaderItIsStoppingRunnersAndReleasesThem(t *testing.T) 
 		t.Fatal(err)
 	}
 	inst := filepath.Join(root, "proj", ".groundhog")
-	for _, d := range []string{"schedule", "out", "fired", "runtime"} {
-		if err := os.MkdirAll(filepath.Join(inst, d), 0o755); err != nil {
-			t.Fatal(err)
-		}
+	if err := os.MkdirAll(inst, 0o755); err != nil {
+		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(inst, "groundhog.sh"), script, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	state, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
+	if out, err := exec.Command(filepath.Join(inst, "groundhog.sh"), "init").CombinedOutput(); err != nil {
+		t.Fatalf("init: %v %s", err, out)
+	}
+	gate := filepath.Join(root, "gate")
+	item := filepath.Join(inst, "schedule", "daily", "slow")
+	if err := os.MkdirAll(item, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	sup, err := core.NewSupervisor(core.SupervisorConfig{Exec: runner.Process{}, Launcher: runner.Spawner{}, StateDir: state,
-		PollEvery: 50 * time.Millisecond, StartWait: 10 * time.Second})
-	if err != nil {
+	if err := os.WriteFile(filepath.Join(item, "run"), []byte("#!/bin/sh\nwhile [ ! -e \""+gate+"\" ]; do sleep 0.05; done\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.WriteFile(gate, nil, 0o644) }) // the run ends with the test, whatever happens
+
 	client, err := groundhog.New(runner.Process{}, inst)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if support, err := client.Negotiate(context.Background()); err != nil || !support.Controllable {
-		t.Skipf("this host cannot run supervised control: %+v %v", support, err)
+		t.Skipf("this host offers no runs: %+v %v", support, err)
 	}
-	t.Cleanup(func() { sup.Quit(context.Background()) })
-
-	if _, err := sup.Run(context.Background(), inst); err != nil {
-		t.Fatal(err)
-	}
-	var stderr bytes.Buffer
-	shutdown(sup, nil, &stderr)
-	if !strings.HasPrefix(stderr.String(), "easyhog: Stopping 1 runner(s)") || !strings.Contains(stderr.String(), "30s") {
-		t.Fatalf("stderr %q", stderr.String())
-	}
-	st, err := client.Status(context.Background())
-	if err != nil || st.Owner != nil || st.Runner.State == groundhog.RunnerRunning {
-		t.Fatalf("after shutdown: %+v %v", st, err)
-	}
-	if info, ok := sup.Runner(inst); ok && info.Phase != core.PhaseReleased {
-		t.Fatalf("phase %v", info.Phase)
-	}
-}
-
-// lockedBuffer lets a test read what shutdown has written while it still runs.
-type lockedBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
-}
-
-func (l *lockedBuffer) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.Write(p)
-}
-
-func (l *lockedBuffer) String() string {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.b.String()
-}
-
-// gateExec holds the first `enroll` until release is closed, then runs it for
-// real, and refuses every `release`, so that Quit has something to report.
-type gateExec struct {
-	runner.Executor
-	once    sync.Once
-	entered chan struct{}
-	release chan struct{}
-}
-
-func (g *gateExec) Run(ctx context.Context, inv runner.Invocation) error {
-	switch inv.Args[0] {
-	case "enroll":
-		g.once.Do(func() { close(g.entered); <-g.release })
-	case "release":
-		return errors.New("release refused for this test")
-	}
-	return g.Executor.Run(ctx, inv)
-}
-
-// A Quit that begins while the first Run of an instance is still enrolling has
-// a runner count of zero. It must still say it is waiting, wait for the enroll,
-// and print what it had to leave behind.
-func TestShutdownWithARunStillEnrollingCountsItAndPrintsItsNotice(t *testing.T) {
-	script, err := os.ReadFile(pinnedScript)
+	// A tick a second, so a loop that kept going would show within the test.
+	tk, err := core.NewTicker(core.TickerConfig{Clients: core.NewClients(runner.Process{}), Interval: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if sum := sha256.Sum256(script); hex.EncodeToString(sum[:]) != pinnedSHA256 {
-		t.Fatalf("%s no longer matches the pinned digest; update the pin deliberately", pinnedScript)
+	if res, err := tk.Run(context.Background(), inst); err != nil || res.TickErr != nil {
+		t.Fatalf("%+v %v", res, err)
 	}
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	state := func() groundhog.DeliveryState {
+		st, err := client.Status(context.Background())
+		if err != nil || len(st.Deliveries) != 1 {
+			t.Fatalf("%+v %v", st, err)
+		}
+		return st.Deliveries[0].State
 	}
-	inst := filepath.Join(root, "proj", ".groundhog")
-	for _, d := range []string{"schedule", "out", "fired", "runtime"} {
-		if err := os.MkdirAll(filepath.Join(inst, d), 0o755); err != nil {
-			t.Fatal(err)
+	for deadline := time.Now().Add(10 * time.Second); state() != groundhog.DeliveryRunning; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the run never started: %s", state())
 		}
 	}
-	if err := os.WriteFile(filepath.Join(inst, "groundhog.sh"), script, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	state, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	gate := &gateExec{Executor: runner.Process{}, entered: make(chan struct{}), release: make(chan struct{})}
-	sup, err := core.NewSupervisor(core.SupervisorConfig{Exec: gate, Launcher: runner.Spawner{}, StateDir: state,
-		PollEvery: 50 * time.Millisecond, StartWait: 10 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	client, err := groundhog.New(runner.Process{}, inst)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if support, err := client.Negotiate(context.Background()); err != nil || !support.Controllable {
-		t.Skipf("this host cannot run supervised control: %+v %v", support, err)
-	}
-	ran := make(chan struct{})
-	go func() { defer close(ran); _, _ = sup.Run(context.Background(), inst) }()
-	select {
-	case <-gate.entered:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the enroll never began")
-	}
-	if n := len(sup.Runners()); n != 0 {
-		t.Fatalf("%d runners listed while the first Run is still enrolling", n)
-	}
 
-	var stderr lockedBuffer
-	finished := make(chan struct{})
-	go func() { defer close(finished); shutdown(sup, nil, &stderr) }()
-	deadline := time.Now().Add(30 * time.Second)
-	for !strings.Contains(stderr.String(), "Stopping 1 runner(s)") && time.Now().Before(deadline) {
-		select {
-		case <-finished:
-			deadline = time.Now() // shutdown ended without saying it was waiting
-		case <-time.After(10 * time.Millisecond):
+	began := time.Now()
+	shutdown(tk, nil, io.Discard)
+	if d := time.Since(began); d > 5*time.Second {
+		t.Errorf("shutdown took %s", d)
+	}
+	if s := state(); s != groundhog.DeliveryRunning {
+		t.Fatalf("after shutdown the run reads %s, want still running", s)
+	}
+	// Ticking stopped: the loop is done, no later tick is recorded, and the
+	// ticker takes no new Run.
+	if info, _ := tk.Info(inst); info.Ticking {
+		t.Error("still ticking after shutdown")
+	}
+	lastTick := func() time.Time {
+		st, err := client.Status(context.Background())
+		if err != nil || st.LastTick == nil {
+			t.Fatalf("%+v %v", st.LastTick, err)
 		}
+		return st.LastTick.At
 	}
-	if !strings.HasPrefix(stderr.String(), "easyhog: Stopping 1 runner(s)") {
-		t.Fatalf("stderr before the enroll finished: %q", stderr.String())
+	before := lastTick()
+	time.Sleep(2500 * time.Millisecond)
+	if after := lastTick(); !after.Equal(before) {
+		t.Errorf("a tick at %s after shutdown (the last was %s)", after, before)
 	}
-	close(gate.release)
-	select {
-	case <-finished:
-	case <-time.After(60 * time.Second):
-		t.Fatal("shutdown did not return")
+	if _, err := tk.Run(context.Background(), inst); err == nil {
+		t.Error("Run worked after shutdown")
 	}
-	<-ran
-	out := stderr.String()
-	if !strings.Contains(out, "left owned") {
-		t.Fatalf("shutdown printed no notice for the instance it left owned: %q", out)
+	if err := os.WriteFile(gate, nil, 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(out, "SECRET") || strings.Contains(out, `"token"`) {
-		t.Errorf("a token's contents reached stderr: %q", out)
+	for deadline := time.Now().Add(10 * time.Second); state() != groundhog.DeliveryAccepted; time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the run never finished: %s", state())
+		}
 	}
 }

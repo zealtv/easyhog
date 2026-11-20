@@ -14,7 +14,7 @@ export GOCACHE := $(CURDIR)/.cache/go-build
 GOFLAGS += -modcacherw
 export GOFLAGS
 
-.PHONY: build test check install cross-check clean fixtures acceptance
+.PHONY: build test check install cross-check clean acceptance
 build:
 	$(GO) build $(LDFLAGS) -o $(BIN) ./cmd/easyhog
 
@@ -25,18 +25,11 @@ check:
 	@files="$$(gofmt -l cmd internal)" && test -z "$$files" || { echo 'Go formatting needed'; exit 1; }
 	$(GO) vet ./...
 
-# Runs examples/consumers through a real Groundhog runner. Needs EASYHOG_GROUNDHOG_SH
-# (a groundhog.sh with consumer-v1 and delivery-v1); EASYHOG_WAKE_CONSUMER is optional.
-# Without them it skips with a message. Not part of `make test`.
-fixtures:
-	@bash examples/consumers/fixtures.sh
-
-# The MVP acceptance session (internal/acceptance): a reader's whole session over
+# The acceptance session (internal/acceptance): a reader's whole session over
 # temporary synthetic repositories, through the core and the TUI model, with real
-# Groundhog runners on the pinned script. About 40 seconds. EASYHOG_ACCEPTANCE=1
-# turns it on (plain `go test` skips it). EASYHOG_WAKE_CONSUMER, an absolute path
-# to a wake adapter, adds the in-place wake on a private tmux server;
-# unset (or without tmux), that step reports a skip and the rest runs. Needs bash.
+# ticks of the pinned Groundhog script and the example runs in examples/runs.
+# Under a minute. EASYHOG_ACCEPTANCE=1 turns it on (plain `go test` skips it).
+# Needs bash.
 acceptance:
 	EASYHOG_ACCEPTANCE=1 $(GO) test -count=1 -timeout 10m -v ./internal/acceptance
 

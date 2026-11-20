@@ -62,7 +62,7 @@ func newIdleRig(t *testing.T, names ...string) *idleRig {
 	}
 	log := &callLog{}
 	ref, err := core.NewRefresher(core.Config{Root: root, FS: discovery.OS{}, Exec: log,
-		Interval: 20 * time.Millisecond, SelectSettle: 10 * time.Millisecond, Retries: -1})
+		Interval: 20 * time.Millisecond, SelectSettle: 10 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

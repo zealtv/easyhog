@@ -65,7 +65,7 @@ func TestOversizedStdoutStopsAScriptThatKeepsWriting(t *testing.T) {
 func TestStderrIsKeptBoundedAndTidy(t *testing.T) {
 	noisy := "error: pause: the instance is busy\n" + strings.Repeat("noise line\n", 50000) + "\x1b[31mred\x1b[0m"
 	f := newFake(t).on("pause", exits(4, noisy))
-	err := controlClient(t, f).Pause(context.Background(), tokenPath, WithMaxStderr(2048))
+	err := controlClient(t, f).Pause(context.Background(), WithMaxStderr(2048))
 	var ee *ExitError
 	if !errors.As(err, &ee) {
 		t.Fatal(err)
@@ -78,18 +78,18 @@ func TestStderrIsKeptBoundedAndTidy(t *testing.T) {
 		t.Errorf("message %q", msg)
 	}
 	// Short stderr is kept whole and not flagged.
-	f = newFake(t).on("pause", exits(3, "error: stale\n"))
-	err = controlClient(t, f).Pause(context.Background(), tokenPath)
-	if !errors.As(err, &ee) || ee.Stderr != "error: stale\n" || ee.StderrTruncated {
+	f = newFake(t).on("pause", exits(3, "error: paused\n"))
+	err = controlClient(t, f).Pause(context.Background())
+	if !errors.As(err, &ee) || ee.Stderr != "error: paused\n" || ee.StderrTruncated {
 		t.Errorf("%+v", ee)
 	}
 }
 
 func TestStderrSurvivesATimeout(t *testing.T) {
-	f := newFake(t).on("stop", reply{block: false, stderr: "groundhog: waiting for the runner\n", err: context.DeadlineExceeded})
-	err := controlClient(t, f).Stop(context.Background(), tokenPath, WithTimeout(time.Minute))
+	f := newFake(t).on("tick", reply{block: false, stderr: "fired report -> out/report\n", err: context.DeadlineExceeded})
+	err := controlClient(t, f).Tick(context.Background(), WithTimeout(time.Minute))
 	var ce *CallError
-	if !errors.As(err, &ce) || !strings.Contains(ce.Stderr, "waiting for the runner") {
+	if !errors.As(err, &ce) || !strings.Contains(ce.Stderr, "fired report") {
 		t.Fatalf("%v", err)
 	}
 }

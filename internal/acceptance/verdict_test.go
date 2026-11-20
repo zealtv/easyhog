@@ -4,29 +4,25 @@ package acceptance
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-
 	"github.com/zealtv/easyhog/internal/core"
 	"github.com/zealtv/easyhog/internal/tui"
 )
 
-// TestPendingWorkVerdict follows the one-line answer to "will pending work be
-// actioned?" through real scripts on the pinned copy. Three instances stand
-// for the three ways an instance gets ticked: Easyhog's own runner, a
-// standalone `tick` from something outside, and nothing. An old tick is made
-// by writing the script's own record file with an earlier time, which stands
-// in for waiting out the 3-minute threshold.
+// TestPendingWorkVerdict follows the one-line answer to "will due items fire?"
+// through real scripts on the pinned copy. Instances stand for the ways one gets
+// ticked: this session, a standalone `tick` from something outside, and
+// nothing. An old tick is made by writing the script's own record file with an
+// earlier time, which stands in for waiting out the 3-minute threshold.
 func TestPendingWorkVerdict(t *testing.T) {
 	w := newWorld(t, gate(t))
 	ours, outside, aged, quiet := w.instance("ours"), w.instance("outside"), w.instance("aged"), w.instance("quiet")
 	for _, inst := range []string{ours, outside, aged, quiet} {
-		w.item(inst, "every/1h", "hourly", "synthetic note") // gives a runner something to hold, nothing due at once
+		w.item(inst, future, "later", "synthetic note") // nothing due at once
 	}
 	w.hog(outside, "tick")
 	w.hog(aged, "tick")
@@ -38,90 +34,58 @@ func TestPendingWorkVerdict(t *testing.T) {
 		w.selectInstance(rel)
 		return w.node(rel).Badge
 	}
-	if b := badge("outside"); !strings.HasPrefix(b, "probably · ") || strings.Contains(b, "tick") {
-		t.Errorf("an unowned instance ticked standalone just now: badge %q, want probably, with no tick age", b)
+	// The row's badge leaves the verdict out (the state word and the heartbeat
+	// mark say it; Bob, 2026-11-19), and the preview keeps the whole verdict.
+	noVerdict := func(b string) bool {
+		return !strings.Contains(b, "tick") && !strings.Contains(b, "probably") && !strings.Contains(b, "paused")
 	}
-	// Its tick is seconds old: the mark after the state word reads fresh.
-	if h := w.node("outside").Heartbeat; h != core.HeartbeatFresh {
-		t.Errorf("an instance ticked standalone just now: heartbeat %v, want fresh", h)
+	if b := badge("outside"); !noVerdict(b) {
+		t.Errorf("ticked standalone just now: badge %q, want no verdict and no tick age in it", b)
+	}
+	if n := w.node("outside"); n.Heartbeat != core.HeartbeatFresh || n.State != tui.StateExternal || !strings.HasPrefix(n.Detail, "ticked from outside Easyhog") {
+		t.Errorf("ticked standalone just now: state %v, detail %q, heartbeat %v", n.State, n.Detail, n.Heartbeat)
 	}
 	if !strings.Contains(w.screen(), "Pending work: probably, something outside Easyhog ticked it") {
 		t.Errorf("preview lacks the probable verdict\n%s", w.screen())
 	}
-	// The row reads external though no owner is recorded: something outside ticks it.
-	if n := w.node("outside"); n.State != tui.StateExternal || !strings.HasPrefix(n.Detail, "ticked from outside Easyhog") {
-		t.Errorf("an instance ticked standalone just now: state %v, detail %q, want external, ticked from outside Easyhog", n.State, n.Detail)
-	}
-	noVerdict := func(b string) bool {
-		return !strings.Contains(b, "tick") && !strings.HasPrefix(b, "will run") && !strings.HasPrefix(b, "probably") && !strings.HasPrefix(b, "paused")
-	}
 	if b := badge("aged"); !noVerdict(b) || w.node("aged").State != tui.StateStopped {
-		t.Errorf("a tick 10 minutes old: badge %q, want no verdict in it", b)
+		t.Errorf("a tick 10 minutes old: badge %q, state %v", b, w.node("aged").State)
 	}
-	if b := badge("quiet"); !noVerdict(b) {
-		t.Errorf("an instance never ticked: badge %q, want no verdict in it", b)
-	}
-	if !strings.Contains(w.screen(), "nothing seen ticking it; no tick recorded.") {
-		t.Errorf("preview lacks the never-ticked wording\n%s", w.screen())
+	if b := badge("quiet"); !noVerdict(b) || !strings.Contains(w.screen(), "nothing seen ticking it; no tick recorded.") {
+		t.Errorf("never ticked: badge %q\n%s", b, w.screen())
 	}
 
-	// Run: this session's runner ticks, so the verdict becomes yes; a pause set outside Easyhog makes it no
-	// (Easyhog sets none itself).
-	if res, err := w.sup.Run(w.ctx, ours); err != nil || res.Outcome != core.RunStarted {
-		t.Fatalf("Run: %+v %v", res, err)
-	}
-	w.await("the runner's first recorded tick", 20*time.Second, func() bool { return w.status(ours).LastTick != nil })
+	// Run: this session ticks it, so the verdict is yes; Pause instance makes it no.
+	w.selectInstance("ours")
+	w.palette("run")
+	w.await("the first tick to be recorded", 20*time.Second, func() bool { return w.status(ours).LastTick != nil })
 	w.reread("ours")
-	if b := w.node("ours").Badge; !strings.HasPrefix(b, "will run · ") || strings.Contains(b, "tick") {
-		t.Errorf("our runner is running: badge %q, want will run, with no tick age", b)
+	if n := w.node("ours"); !noVerdict(n.Badge) || n.Heartbeat != core.HeartbeatFresh || n.State != tui.StateRunning {
+		t.Errorf("ticked here: badge %q, heartbeat %v, state %v", n.Badge, n.Heartbeat, n.State)
 	}
-	if h := w.node("ours").Heartbeat; h != core.HeartbeatFresh {
-		t.Errorf("our runner has just ticked: heartbeat %v, want fresh", h)
+	if !strings.Contains(w.flat(), "Pending work: yes, this session ticks it") {
+		t.Errorf("preview lacks the yes verdict\n%s", w.screen())
 	}
-	info, ok := w.sup.Runner(ours)
-	if !ok {
-		t.Fatal("the supervisor holds nothing for the instance it ran")
-	}
-	if err := w.client(ours).Pause(w.ctx, info.TokenFile); err != nil {
-		t.Fatal(err)
-	}
+	w.palette("pause in")
 	w.reread("ours")
-	if b := w.node("ours").Badge; !strings.HasPrefix(b, "paused: won't run") {
-		t.Errorf("paused: badge %q, want paused: won't run", b)
+	if n := w.node("ours"); !noVerdict(n.Badge) || n.State != tui.StatePaused || !strings.Contains(w.flat(), "Pending work: no, the instance is paused.") {
+		t.Errorf("paused: badge %q, state %v\n%s", n.Badge, n.State, w.screen())
 	}
 
-	confirmRunOnAnInstanceTickedFromOutside(t, w, outside, aged)
-}
+	// Stop: this session's own fresh tick does not make the row external.
+	w.palette("unpause")
+	w.palette("stop")
+	w.reread("ours")
+	if n := w.node("ours"); n.State != tui.StateStopped || !strings.Contains(w.flat(), "since this session stopped") {
+		t.Errorf("stopped here: state %v %q\n%s", n.State, n.Detail, w.screen())
+	}
 
-// Run on an instance something outside Easyhog ticks asks first, because
-// enrolling it makes those ticks fail with exit 3 until Stop releases it. Esc
-// leaves it untouched; an instance nothing ticks runs without a question; and
-// yes enrols it, after which the outside tick fails, as the question warned.
-func confirmRunOnAnInstanceTickedFromOutside(t *testing.T, w *world, outside, aged string) {
+	// Run on the instance ticked from outside asks nothing, and its outside
+	// ticks still work beside this session's.
 	w.selectInstance("outside")
 	w.palette("run")
-	if flat := w.flat(); !strings.Contains(flat, "Run anyway?") || !strings.Contains(flat, "those ticks will fail until you Stop it here") {
-		t.Errorf("Run on an instance ticked from outside did not ask\n%s", w.screen())
+	if !w.said("Run: outside: ticked") {
+		t.Fatalf("Run on an instance ticked from outside\n%s", w.screen())
 	}
-	w.send(press(tea.KeyEsc))
-	if _, held := w.sup.Runner(outside); held || w.easy.startsFor(outside) != 0 || w.status(outside).Owner != nil {
-		t.Errorf("declining Run still enrolled or started the instance")
-	}
-
-	// Its tick is 10 minutes old: stopped, and Run starts without a question.
-	w.selectInstance("aged")
-	w.palette("run")
-	if strings.Contains(w.screen(), "Run anyway?") {
-		t.Errorf("Run asked about an instance nothing ticks\n%s", w.screen())
-	}
-	w.await("Easyhog to own the aged instance", 30*time.Second, func() bool { return w.status(aged).Owner != nil })
-
-	// Yes: Enter on the question.
-	w.selectInstance("outside")
-	w.palette("run")
-	w.send(press(tea.KeyEnter))
-	w.await("Easyhog to own the outside instance", 30*time.Second, func() bool { return w.status(outside).Owner != nil })
-	if out, err := exec.Command(filepath.Join(outside, "groundhog.sh"), "tick").CombinedOutput(); err == nil {
-		t.Errorf("a standalone tick on an instance Easyhog owns succeeded: %s", out)
-	}
+	w.hog(outside, "tick")
 }

@@ -7,141 +7,95 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/zealtv/easyhog/internal/core"
 	"github.com/zealtv/easyhog/internal/groundhog"
-	"github.com/zealtv/easyhog/internal/runner"
 )
 
 // Synthetic instances only: nothing here runs a script.
 
-func ours(name string, runnerState groundhog.RunnerState, paused bool) core.InstanceView {
-	st := okStatus()
-	st.Owner = &groundhog.Owner{ID: "easyhog-1", Label: "easyhog"}
-	st.Runner.State, st.Paused = runnerState, paused
-	return iv(name, core.ClassOwnedBySession, core.HealthOK, core.Inspection{Last: obs(st)})
+func supported(name string) core.InstanceView {
+	return iv(name, core.ClassSupported, core.HealthOK, core.Inspection{Last: obs(okStatus())})
 }
 
-func unowned(name string) core.InstanceView {
-	return iv(name, core.ClassUnowned, core.HealthOK, core.Inspection{Last: obs(okStatus())})
+func pausedInstance(name string) core.InstanceView {
+	v := supported(name)
+	v.Inspection.Last.Status.Paused = true
+	return v
 }
 
-func lookup(infos map[string]core.RunnerInfo) RunnerLookup {
-	return func(key string) (core.RunnerInfo, bool) { i, ok := infos[key]; return i, ok }
+// ticks is a TickLookup over the keys this session ticks.
+func ticks(keys ...string) TickLookup {
+	return func(key string) (core.TickInfo, bool) {
+		for _, k := range keys {
+			if k == key {
+				return core.TickInfo{Ticking: true, Interval: core.DefaultTickInterval}, true
+			}
+		}
+		return core.TickInfo{}, false
+	}
 }
 
-func actionsOf(t *testing.T, v core.InstanceView, infos map[string]core.RunnerInfo) string {
+func actionsOf(t *testing.T, v core.InstanceView, look TickLookup) string {
 	t.Helper()
-	d := FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookup(infos))
+	d := FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, look)
 	var out []string
 	for _, a := range d.Nodes[0].Actions {
-		if a == ActionOpenFolder {
-			continue
+		if a != ActionOpenFolder {
+			out = append(out, string(a))
 		}
-		out = append(out, string(a))
 	}
 	return strings.Join(out, ",")
 }
 
-// Run and Stop appear only where they can work: the offered controls follow
-// ownership and protocol status, and nothing misleading is offered otherwise.
+// The palette's actions appear only where they can work, by core.Offers, and
+// nothing misleading is offered otherwise.
 func TestOfferedControlsPerClass(t *testing.T) {
-	good := obs(okStatus())
-	foreign := okStatus()
-	foreign.Owner = &groundhog.Owner{ID: "o-1", Label: "team-supervisor"}
-	foreign.Runner.State = groundhog.RunnerRunning
-	foreignStopped := foreign
-	foreignStopped.Runner.State = groundhog.RunnerStopped
-	incoherent := okStatus()
-	incoherent.Consistent = false
+	failed := supported("fd")
+	failed.Inspection.Last.Status.Deliveries = []groundhog.Delivery{{Path: "out/x", State: groundhog.DeliveryFailed}}
 	malformed := iv("m", core.ClassMalformed, core.HealthOK, core.Inspection{})
 	malformed.Instance.Malformed = []string{"groundhog.sh is missing"}
-	failingNeverRead := iv("f", core.ClassFailing, core.HealthOK, core.Inspection{Err: errors.New("timed out")})
-	failingWithLast := unowned("fl")
+	failingWithLast := supported("fl")
 	failingWithLast.Inspection.Err = errors.New("timed out")
-	stale := unowned("s")
+	stale := supported("s")
 	stale.Health = core.HealthStale
-	ourStale := ours("os", groundhog.RunnerRunning, false)
-	ourStale.Health = core.HealthStale
-
 	cases := []struct {
 		name string
 		v    core.InstanceView
+		look TickLookup
 		want string
 	}{
-		{"unowned and controllable", unowned("a"), "run"},
-		{"ours, running", ours("b", groundhog.RunnerRunning, false), "stop"},
-		{"ours, running but paused", ours("c", groundhog.RunnerRunning, true), "run,stop"},
-		{"ours, runner stopped", ours("d", groundhog.RunnerStopped, false), "run,stop"},
-		{"ours, stopped and paused", ours("e", groundhog.RunnerStopped, true), "run,stop"},
-		{"ours, runner failed", ours("f", groundhog.RunnerFailed, false), "run,stop"},
-		{"ours, runner stopping", ours("g", groundhog.RunnerStopping, false), ""},
-		{"ours, runner state unknown", ours("h", groundhog.RunnerUnknown, false), ""},
-		{"external, runner alive", iv("i", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(foreign)}), ""},
-		{"external, runner stopped", iv("j", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(foreignStopped)}), ""},
-		{"unsupported", iv("k", core.ClassUnsupported, core.HealthOK, core.Inspection{Last: good}), ""},
-		{"legacy", iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{Support: &groundhog.Support{Reason: "old"}}), ""},
-		{"malformed", malformed, ""},
-		{"not inspected yet", iv("n", core.ClassNotInspected, core.HealthOK, core.Inspection{}), ""},
-		{"failing, never read", failingNeverRead, ""},
-		{"failing, with an old status", failingWithLast, ""},
-		{"inconsistent", iv("o", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(incoherent)}), ""},
-		{"stale", stale, ""},
-		{"ours but stale", ourStale, ""},
+		{"supported, not ticked here", supported("a"), nil, "run,pause"},
+		{"ticked here", supported("b"), ticks("/r/b/.groundhog"), "stop,pause"},
+		{"paused", pausedInstance("c"), nil, "run,unpause"},
+		{"paused and ticked here", pausedInstance("d"), ticks("/r/d/.groundhog"), "stop,unpause"},
+		{"a failed delivery", failed, nil, "run,pause,retry"},
+		{"unsupported", iv("k", core.ClassUnsupported, core.HealthOK, core.Inspection{Last: obs(okStatus())}), nil, ""},
+		{"legacy", iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{Support: &groundhog.Support{Reason: "old"}}), nil, ""},
+		{"malformed", malformed, nil, ""},
+		{"not inspected yet", iv("n", core.ClassNotInspected, core.HealthOK, core.Inspection{}), nil, ""},
+		{"failing, never read", iv("f", core.ClassFailing, core.HealthOK, core.Inspection{Err: errors.New("timed out")}), nil, ""},
+		{"failing, with an old status", failingWithLast, nil, ""},
+		{"stale", stale, nil, ""},
 	}
 	for _, c := range cases {
-		if got := actionsOf(t, c.v, nil); got != c.want {
+		look := c.look
+		if look == nil {
+			look = ticks()
+		}
+		if got := actionsOf(t, c.v, look); got != c.want {
 			t.Errorf("%s: offers %q, want %q", c.name, got, c.want)
 		}
 	}
-
-	// Without a supervisor nothing is offered, whatever the class.
-	d := FromViewWith(core.View{Instances: []core.InstanceView{unowned("a")}}, nil)
-	if got := d.Nodes[0].Actions; len(got) != 1 || got[0] != ActionOpenFolder {
-		t.Errorf("no supervisor: %v", got)
-	}
-	d = FromView(core.View{Instances: []core.InstanceView{unowned("a")}})
-	if got := d.Nodes[0].Actions; len(got) != 1 || got[0] != ActionOpenFolder {
-		t.Errorf("FromView: %v", got)
-	}
-}
-
-// An adopted instance reads as this session's own and says where it came from:
-// its runner, if it still runs, belongs to the session that ended.
-func TestAdoptedInstanceSaysWhereItCameFrom(t *testing.T) {
-	v := ours("x", groundhog.RunnerRunning, false)
-	key := v.Instance.Path
-	ended := time.Date(2026, 11, 17, 14, 3, 0, 0, time.Local)
-	info := core.RunnerInfo{Instance: key, Phase: core.PhaseEnrolled, Adopted: true, AdoptedFrom: ended}
-	if got := actionsOf(t, v, map[string]core.RunnerInfo{key: info}); got != "stop" {
-		t.Fatalf("an adopted, running instance offers %q, want stop", got)
-	}
-	d := FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(map[string]core.RunnerInfo{key: info}))
-	if !strings.Contains(d.Nodes[0].Preview, "Adopted from a session that ended at 14:03") {
-		t.Errorf("preview lacks the adoption note:\n%s", d.Nodes[0].Preview)
-	}
-	info.Adopted = false // a runner of this session's own has been started since
-	d = FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(map[string]core.RunnerInfo{key: info}))
-	if strings.Contains(d.Nodes[0].Preview, "Adopted") {
-		t.Errorf("preview still says adopted:\n%s", d.Nodes[0].Preview)
-	}
-}
-
-// A runner that ended on its own is shown failed, with the notice (and its log
-// path) in the preview, and Run offers a start again.
-func TestRunnerThatEndedOnItsOwnShowsItsNoticeAndOffersRun(t *testing.T) {
-	v := ours("x", groundhog.RunnerStopped, false)
-	key := v.Instance.Path
-	info := core.RunnerInfo{Instance: key, Phase: core.PhaseExited, Notice: "runner ended on its own (exit status 1) and was not restarted; log /state/i1.log"}
-	d := FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(map[string]core.RunnerInfo{key: info}))
-	n := d.Nodes[0]
-	if n.State != StateFailed || !strings.Contains(n.Detail, "runner ended on its own") ||
-		!strings.Contains(n.Preview, "log /state/i1.log") || !hasAction(n, ActionRun) {
-		t.Fatalf("%+v", n)
+	// Without a ticker nothing is offered, whatever the class.
+	for _, d := range []Data{FromViewWith(core.View{Instances: []core.InstanceView{supported("a")}}, nil),
+		FromView(core.View{Instances: []core.InstanceView{supported("a")}})} {
+		if got := d.Nodes[0].Actions; len(got) != 1 || got[0] != ActionOpenFolder {
+			t.Errorf("no ticker: %v", got)
+		}
 	}
 }
 
@@ -154,134 +108,124 @@ func hasAction(n Node, a Action) bool {
 	return false
 }
 
-// The preview says why Run and Stop are missing, and how a not-yet-inspected
-// instance becomes runnable.
+// The preview says why nothing is offered, and how a not-yet-inspected instance
+// becomes runnable.
 func TestPreviewSaysWhyNoControlIsOffered(t *testing.T) {
 	cases := map[string]struct {
 		v    core.InstanceView
 		want string
 	}{
-		"fresh":    {iv("n", core.ClassNotInspected, core.HealthOK, core.Inspection{}), "not until its first status read shows it unowned and controllable (select it, or choose Refresh)"},
-		"external": {iv("e", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(okStatus())}), "another supervisor owns it, running or not"},
-		"legacy":   {iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{}), "the script lacks the runtime commands"},
-		"unowned":  {unowned("u"), "Palette offers: Run"},
-		"running":  {ours("r", groundhog.RunnerRunning, false), "Palette offers: Stop"},
+		"fresh":     {iv("n", core.ClassNotInspected, core.HealthOK, core.Inspection{}), "not until its first status read (select it, or choose Refresh)"},
+		"legacy":    {iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{}), "an older Groundhog or lacks the runtime commands"},
+		"supported": {supported("u"), "Palette offers: Run, Pause instance"},
 	}
 	for name, c := range cases {
-		d := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, lookup(nil))
+		d := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, ticks())
 		if !strings.Contains(d.Nodes[0].Preview, c.want) {
 			t.Errorf("%s: preview lacks %q:\n%s", name, c.want, d.Nodes[0].Preview)
 		}
 	}
+	d := FromViewWith(core.View{Instances: []core.InstanceView{supported("r")}}, ticks("/r/r/.groundhog"))
+	if p := d.Nodes[0].Preview; !strings.Contains(p, "Palette offers: Stop") || !strings.Contains(p, "This session ticks it every 1m00s") {
+		t.Errorf("ticked here:\n%s", p)
+	}
 }
 
-// fakeRunners stands in for the supervisor; the tests that use it assert on the
+// fakeControl stands in for the ticker; the tests that use it assert on the
 // calls and on what the terminal then shows.
-type fakeRunners struct {
+type fakeControl struct {
 	mu      sync.Mutex
-	runs    []string
-	stops   []string
-	release chan struct{} // when set, a call waits for it
+	calls   []string // "run alpha", "pause alpha", "retry alpha schedule/x", …
+	release chan struct{}
 	run     func(key string) (core.RunResult, error)
-	stop    func(key string) (core.StopResult, error)
-	settles []settleCall
-	settle  func(key string, req core.SettleRequest) (core.SettleResult, error)
-	toggles []toggleCall
+	retry   func(key, item string) (core.RetryResult, error)
+	pause   func(key string, pause bool) error
 	toggle  func(key, item string, pause bool) (core.ItemResult, error)
 }
 
-type toggleCall struct {
-	key, item string
-	pause     bool
-}
-
-func (f *fakeRunners) SetItemPaused(ctx context.Context, key, item string, pause bool) (core.ItemResult, error) {
+func (f *fakeControl) called(what string) {
 	f.mu.Lock()
-	f.toggles = append(f.toggles, toggleCall{key, item, pause})
+	f.calls = append(f.calls, what)
 	f.mu.Unlock()
 	if f.release != nil {
 		<-f.release
 	}
+}
+
+func short2(key string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(key, "/r/"), "/.groundhog")
+}
+
+func (f *fakeControl) Run(_ context.Context, key string) (core.RunResult, error) {
+	f.called("run " + short2(key))
+	if f.run != nil {
+		return f.run(key)
+	}
+	return core.RunResult{Instance: key, Ticked: true}, nil
+}
+
+func (f *fakeControl) Stop(key string) core.StopResult {
+	f.called("stop " + short2(key))
+	return core.StopResult{Instance: key, WasTicking: true}
+}
+
+func (f *fakeControl) Retry(_ context.Context, key, item string) (core.RetryResult, error) {
+	f.called(strings.TrimSpace("retry " + short2(key) + " " + item))
+	if f.retry != nil {
+		return f.retry(key, item)
+	}
+	return core.RetryResult{Instance: key, Started: []string{"out/x-1"}}, nil
+}
+
+func (f *fakeControl) SetPaused(_ context.Context, key string, pause bool) error {
+	verb := "unpause"
+	if pause {
+		verb = "pause"
+	}
+	f.called(verb + " " + short2(key))
+	if f.pause != nil {
+		return f.pause(key, pause)
+	}
+	return nil
+}
+
+func (f *fakeControl) SetItemPaused(_ context.Context, key, item string, pause bool) (core.ItemResult, error) {
+	f.called(fmt.Sprintf("item %s %s %v", short2(key), item, pause))
 	if f.toggle != nil {
 		return f.toggle(key, item, pause)
 	}
 	return core.ItemResult{Instance: key, Item: core.ItemIdentity(item), From: item, To: core.ItemTarget(item, pause), Paused: pause, Locked: true}, nil
 }
 
-type settleCall struct {
-	key string
-	req core.SettleRequest
-}
-
-func (f *fakeRunners) Settle(ctx context.Context, key string, req core.SettleRequest) (core.SettleResult, error) {
-	f.mu.Lock()
-	f.settles = append(f.settles, settleCall{key, req})
-	f.mu.Unlock()
-	if f.release != nil {
-		<-f.release
-	}
-	if f.settle != nil {
-		return f.settle(key, req)
-	}
-	return core.SettleResult{Instance: key, Action: req.Action, Settled: []string{"d-1"}, StoppedRunner: true, Restarted: true, PID: 4343, Seen: true}, nil
-}
-
-func (f *fakeRunners) Run(ctx context.Context, key string) (core.RunResult, error) {
-	f.mu.Lock()
-	f.runs = append(f.runs, key)
-	f.mu.Unlock()
-	if f.release != nil {
-		<-f.release
-	}
-	if f.run != nil {
-		return f.run(key)
-	}
-	return core.RunResult{Instance: key, Outcome: core.RunStarted, Enrolled: true, PID: 4242, Seen: true}, nil
-}
-
-func (f *fakeRunners) Stop(ctx context.Context, key string) (core.StopResult, error) {
-	f.mu.Lock()
-	f.stops = append(f.stops, key)
-	f.mu.Unlock()
-	if f.release != nil {
-		<-f.release
-	}
-	if f.stop != nil {
-		return f.stop(key)
-	}
-	return core.StopResult{Instance: key}, nil
-}
-
-func (f *fakeRunners) counts() (int, int) {
+func (f *fakeControl) list() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.runs), len(f.stops)
+	return strings.Join(f.calls, "; ")
 }
 
 type rig struct {
 	t      *testing.T
 	m      Model
-	f      *fakeRunners
+	f      *fakeControl
 	reread []string
 	mu     sync.Mutex
-	infos  map[string]core.RunnerInfo
+	ticked []string
 }
 
-// newRig shows alpha (unowned: Run), bravo (ours, running: Pause) and charlie
-// (external: neither), at 100x30.
-func newRig(t *testing.T, f *fakeRunners) *rig {
+// newRig shows alpha (Run), bravo (ticked here: Stop) and charlie (paused:
+// Unpause instance), at 100x30.
+func newRig(t *testing.T, f *fakeControl) *rig {
 	t.Helper()
-	r := &rig{t: t, f: f}
-	r.m = NewWithData(r.data(unowned("alpha"), ours("bravo", groundhog.RunnerRunning, false),
-		iv("charlie", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(okStatus())})),
-		WithRunners(f, func(k string) { r.mu.Lock(); r.reread = append(r.reread, k); r.mu.Unlock() }))
+	r := &rig{t: t, f: f, ticked: []string{"/r/bravo/.groundhog"}}
+	r.m = NewWithData(r.data(supported("alpha"), supported("bravo"), pausedInstance("charlie")),
+		WithControl(f, func(k string) { r.mu.Lock(); r.reread = append(r.reread, k); r.mu.Unlock() }))
 	next, _ := r.m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	r.m = next.(Model)
 	return r
 }
 
 func (r *rig) data(vs ...core.InstanceView) Data {
-	return FromViewWith(core.View{Root: "/r", Instances: vs}, lookup(r.infos))
+	return FromViewWith(core.View{Root: "/r", Instances: vs}, ticks(r.ticked...))
 }
 
 func (r *rig) send(msgs ...tea.Msg) []tea.Msg {
@@ -293,6 +237,15 @@ func (r *rig) send(msgs ...tea.Msg) []tea.Msg {
 		out = append(out, run(cmd)...)
 	}
 	return out
+}
+
+// do runs the palette command typed as query on the selected row, feeding its
+// result back, and returns the notice.
+func (r *rig) do(query string) string {
+	r.t.Helper()
+	r.send(typeText(":" + query)...)
+	r.send(r.send(key(tea.KeyEnter))...)
+	return r.m.notice
 }
 
 func (r *rig) screen() string { return ansi.Strip(r.m.View()) }
@@ -308,11 +261,8 @@ func (r *rig) names() string {
 // The palette's prompt line names the instance it is bound to, by relative
 // path, and keeps naming it however the selection moves afterwards.
 func TestPalettePromptNamesTheBoundInstance(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	r.send(typeText(":")...)
-	if !strings.Contains(r.screen(), "on alpha") {
-		t.Fatalf("prompt does not name the instance:\n%s", r.screen())
-	}
 	line := ""
 	for _, l := range strings.Split(r.screen(), "\n") {
 		if strings.Contains(l, "type a command") {
@@ -322,12 +272,10 @@ func TestPalettePromptNamesTheBoundInstance(t *testing.T) {
 	if !strings.Contains(line, "on alpha") {
 		t.Fatalf("the name is not on the prompt line: %q", line)
 	}
-	// Moving the selection behind the open palette does not rebind it.
 	r.send(key(tea.KeyEsc), key(tea.KeyDown), typeText(":")[0])
 	if !strings.Contains(r.screen(), "on bravo") || strings.Contains(r.screen(), "on alpha") {
 		t.Fatalf("prompt after moving:\n%s", r.screen())
 	}
-	// Nothing selected: no name.
 	empty := NewWithData(Data{Root: "/r"})
 	empty, _ = feed(empty, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(":")[0])
 	if strings.Contains(ansi.Strip(empty.View()), " on ") {
@@ -336,10 +284,9 @@ func TestPalettePromptNamesTheBoundInstance(t *testing.T) {
 }
 
 func TestPalettePromptKeepsTheEndOfALongPathAndTheQuery(t *testing.T) {
-	long := strings.Repeat("deep/", 12) + "project/.groundhog"
-	v := unowned("x")
-	v.Instance.Display = long
-	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil)), WithRunners(&fakeRunners{}, nil))
+	v := supported("x")
+	v.Instance.Display = strings.Repeat("deep/", 12) + "project/.groundhog"
+	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks()), WithControl(&fakeControl{}, nil))
 	m, _ = feed(m, tea.WindowSizeMsg{Width: 60, Height: 24}, typeText(":pla")[0], typeText("pla")[0], typeText("pla")[1], typeText("pla")[2])
 	out := ansi.Strip(m.View())
 	if !strings.Contains(out, "project") || !strings.Contains(out, "pla▌") {
@@ -354,32 +301,29 @@ func TestPalettePromptKeepsTheEndOfALongPathAndTheQuery(t *testing.T) {
 
 // Hostile directory names stay inert in the prompt.
 func TestPalettePromptNameIsInert(t *testing.T) {
-	v := unowned("x")
+	v := supported("x")
 	v.Instance.Display = "evil\x1b[2J\x07dir/.groundhog"
-	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil)))
+	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks()))
 	m, _ = feed(m, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(":")[0])
 	if out := m.View(); strings.Contains(out, "\x1b[2J") || strings.Contains(out, "\x07") {
 		t.Fatal("control sequence reached the frame")
 	}
 }
 
-// Run goes to the supervisor off the update loop, shows "Running …" while it
-// waits, offers neither Run nor Pause again for that instance (the palette does
-// not queue a second one), and then shows the exact outcome.
+// Run goes to the ticker off the update loop, shows "Running …" while it
+// waits, offers no action on that instance again (the palette does not queue a
+// second one), and then shows the exact outcome.
 func TestRunShowsTransitionThenOutcomeAndDoesNotQueueASecond(t *testing.T) {
-	f := &fakeRunners{release: make(chan struct{})}
+	f := &fakeControl{release: make(chan struct{})}
 	r := newRig(t, f)
-	if r.names() != "Run,Open folder,Refresh,Quit" {
+	if r.names() != "Run,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("alpha offers %s", r.names())
 	}
 	r.send(typeText(":run")...)
 	next, cmd := r.m.Update(key(tea.KeyEnter))
 	r.m = next.(Model)
-	if cmd == nil {
-		t.Fatal("Run scheduled nothing")
-	}
-	if n, _ := f.counts(); n != 0 {
-		t.Fatal("Run ran on the update loop")
+	if cmd == nil || f.list() != "" {
+		t.Fatal("Run ran on the update loop, or scheduled nothing")
 	}
 	if !strings.Contains(r.screen(), "Running alpha…") {
 		t.Fatalf("no transitional state:\n%s", r.screen())
@@ -387,13 +331,7 @@ func TestRunShowsTransitionThenOutcomeAndDoesNotQueueASecond(t *testing.T) {
 	if r.names() != "Open folder,Refresh,Quit" {
 		t.Fatalf("while Run runs the palette offers %s", r.names())
 	}
-
-	// A second invocation while the first is under way finds nothing to run:
-	// the palette does not offer Run, so Enter has nothing chosen.
 	r.send(typeText(":run")...)
-	if got := r.m.filtered(); len(got) != 0 {
-		t.Fatalf("the palette still finds %d commands for \"run\"", len(got))
-	}
 	if msgs := r.send(key(tea.KeyEnter)); len(msgs) != 0 {
 		t.Fatalf("a second Run scheduled %v", msgs)
 	}
@@ -402,70 +340,112 @@ func TestRunShowsTransitionThenOutcomeAndDoesNotQueueASecond(t *testing.T) {
 	done := make(chan tea.Msg, 1)
 	go func() { done <- cmd() }()
 	close(f.release)
-	msg := <-done
-	r.send(msg)
-	if p, _ := f.counts(); p != 1 {
-		t.Fatalf("Run reached the supervisor %d times", p)
+	r.send(<-done)
+	if f.list() != "run alpha" {
+		t.Fatalf("calls %q", f.list())
 	}
-	want := "Run: alpha: enrolled for this session, runner started (pid 4242), status shows it running"
-	if r.m.notice != want || r.m.failure {
+	if want := "Run: alpha: ticked, and ticking every minute while Easyhog runs"; r.m.notice != want || r.m.failure {
 		t.Fatalf("notice %q (failure %v)", r.m.notice, r.m.failure)
 	}
 	if len(r.reread) != 1 || r.reread[0] != "/r/alpha/.groundhog" {
 		t.Fatalf("reread %v", r.reread)
 	}
-	if len(r.m.busy) != 0 || r.names() != "Run,Open folder,Refresh,Quit" {
+	if len(r.m.busy) != 0 || r.names() != "Run,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("not offered again after the answer: busy %v, %s", r.m.busy, r.names())
 	}
 }
 
-// After Run, the refresher's next view (running, ours) shows the instance
-// running with Pause offered instead of Run.
+// After Run, the next view (this session ticks it) shows the instance running
+// with Stop offered instead of Run.
 func TestRunThenRefreshShowsRunning(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
-	r.send(typeText(":run")...)
-	msgs := r.send(key(tea.KeyEnter))
-	r.send(msgs...)
-	if p, _ := r.f.counts(); p != 1 {
-		t.Fatalf("runs: %d", p)
-	}
+	r := newRig(t, &fakeControl{})
+	r.do("run")
 	if n := r.m.rows[0].node; n.State != StateStopped {
 		t.Fatalf("before the re-read the row is %v", n.State)
 	}
-	// The re-read arrives: alpha is now ours and its runner runs.
-	r.send(SnapshotMsg{Data: r.data(ours("alpha", groundhog.RunnerRunning, false), ours("bravo", groundhog.RunnerRunning, false),
-		iv("charlie", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(okStatus())}))})
+	r.ticked = append(r.ticked, "/r/alpha/.groundhog")
+	r.send(SnapshotMsg{Data: r.data(supported("alpha"), supported("bravo"), pausedInstance("charlie"))})
 	if n := r.m.rows[0].node; n.State != StateRunning || r.m.selectedInstance() != "/r/alpha/.groundhog" {
 		t.Fatalf("row %v, selected %q", n.State, r.m.selectedInstance())
 	}
-	if r.names() != "Stop,Open folder,Refresh,Quit" {
+	if r.names() != "Stop,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("after Run the palette offers %s", r.names())
 	}
 }
 
-func TestStopShowsTransitionThenOutcome(t *testing.T) {
-	f := &fakeRunners{release: make(chan struct{})}
+func TestStopPauseAndUnpauseGoToTheTickerAndSaySoPlainly(t *testing.T) {
+	f := &fakeControl{}
 	r := newRig(t, f)
-	r.send(key(tea.KeyDown)) // bravo: ours, running
-	r.send(typeText(":stop")...)
-	next, cmd := r.m.Update(key(tea.KeyEnter))
-	r.m = next.(Model)
-	if !strings.Contains(r.screen(), "Stopping bravo…") {
-		t.Fatalf("no transitional state:\n%s", r.screen())
+	r.send(key(tea.KeyDown)) // bravo: ticked here
+	if got := r.do("stop"); got != "Stop: bravo: stopped ticking. Runs already started go on in their own sessions, and anything else that ticks it still does" {
+		t.Errorf("stop: %q", got)
 	}
-	close(f.release)
-	r.send(cmd())
-	want := "Stop: bravo: stopped and released. The runner has ended and nothing owns the instance now, so another supervisor may take it, and Run enrolls it for this session again; deliveries already pending stay pending"
-	if r.m.notice != want || r.m.failure {
-		t.Fatalf("notice %q", r.m.notice)
+	if got := r.do("pause in"); got != "Pause instance: bravo: paused. No tick, from here or anywhere else, fires an item or starts a run until Unpause instance; runs already going carry on" {
+		t.Errorf("pause: %q", got)
 	}
-	if _, n := f.counts(); n != 1 {
-		t.Fatalf("stops %d", n)
+	r.send(key(tea.KeyDown)) // charlie: paused
+	if r.names() != "Run,Unpause instance,Open folder,Refresh,Quit" {
+		t.Fatalf("charlie offers %s", r.names())
+	}
+	if got := r.do("unpause"); got != "Unpause instance: charlie: unpaused. The next tick fires what is due and starts what waits" {
+		t.Errorf("unpause: %q", got)
+	}
+	if f.list() != "stop bravo; pause bravo; unpause charlie" {
+		t.Errorf("calls %q", f.list())
+	}
+	if len(r.reread) != 3 {
+		t.Errorf("reread %v", r.reread)
 	}
 }
 
-// The words for each outcome, exactly. A refusal names the instance by its
-// relative path and gives the supervisor's reason and detail as they are.
+// Retry acts on the node the palette opened on: an item's own deliveries, or
+// all of the instance's, and the notice says what started and what was busy.
+func TestRetryOnAnItemRetriesThatItemsDeliveriesAndSaysWhatWasBusy(t *testing.T) {
+	v := supported("alpha")
+	st := &v.Inspection.Last.Status
+	st.Schedule = []groundhog.ScheduleItem{{Path: "schedule/daily/a", ItemID: "a"}, {Path: "schedule/daily/b", ItemID: "b"}}
+	a, b := "schedule/daily/a", "schedule/daily/b"
+	st.Deliveries = []groundhog.Delivery{
+		{Path: "out/a-1", State: groundhog.DeliveryFailed, SchedulePath: &a},
+		{Path: "out/b-1", State: groundhog.DeliveryInterrupted, SchedulePath: &b},
+	}
+	f := &fakeControl{retry: func(key, item string) (core.RetryResult, error) {
+		if item == "" {
+			return core.RetryResult{Started: []string{"out/a-1"}, Busy: []string{"out/b-1"}}, nil
+		}
+		return core.RetryResult{Started: []string{"out/a-1"}}, nil
+	}}
+	r := &rig{t: t, f: f}
+	r.m = NewWithData(r.data(v), WithControl(f, nil))
+	r.m, _ = feed(r.m, tea.WindowSizeMsg{Width: 100, Height: 30})
+	if n := r.m.rows[0].node; n.State != StateFailed || n.ActionNotes[ActionRetry] != "2 to retry" ||
+		!strings.Contains(n.Preview, "An interrupted run lost its wrapper") {
+		t.Fatalf("instance row %+v", n)
+	}
+	if got := r.do("ret"); got != "Retry: alpha: 1 run started again (out/a-1); busy: nothing was started for out/b-1 (its run is going, or the instance's lock was held); try again shortly" {
+		t.Errorf("instance: %q", got)
+	}
+	r.send(key(tea.KeyRight), key(tea.KeyDown)) // the first item
+	if r.m.rows[r.m.sel].node.ActionNotes[ActionRetry] != "1 to retry" {
+		t.Fatalf("item notes %v", r.m.rows[r.m.sel].node.ActionNotes)
+	}
+	if got := r.do("retry"); got != "Retry: alpha: 1 run started again (out/a-1)" {
+		t.Errorf("item: %q", got)
+	}
+	if f.list() != "retry alpha; retry alpha schedule/daily/a" {
+		t.Errorf("calls %q", f.list())
+	}
+	// A paused instance offers no Retry, and its preview says what waits.
+	p := pausedInstance("p")
+	p.Inspection.Last.Status.Deliveries = st.Deliveries
+	n := FromViewWith(core.View{Instances: []core.InstanceView{p}}, ticks()).Nodes[0]
+	if hasAction(n, ActionRetry) || !strings.Contains(n.Preview, "Retry waits for Unpause instance") {
+		t.Errorf("paused: %v\n%s", n.Actions, n.Preview)
+	}
+}
+
+// The words for each failure, exactly. A refusal names the instance by its
+// relative path and gives the ticker's reason and detail as they are.
 func TestOutcomeTextIsExact(t *testing.T) {
 	const l = "alpha/.groundhog"
 	cases := []struct {
@@ -473,27 +453,16 @@ func TestOutcomeTextIsExact(t *testing.T) {
 		err  error
 		want string
 	}{
-		{"external owner", &core.RefusedError{Op: "run", Instance: "/r/alpha/.groundhog", Reason: core.RefusedExternal,
-			Detail: `owner "team-supervisor" is recorded; ownership and runner liveness are separate, and a stopped owner is not available for takeover`},
-			`alpha/.groundhog: refused: owned by another supervisor: owner "team-supervisor" is recorded; ownership and runner liveness are separate, and a stopped owner is not available for takeover`},
-		{"unsupported", &core.RefusedError{Op: "run", Reason: core.RefusedUnsupported, Detail: "missing consumer-v1"},
-			"alpha/.groundhog: refused: does not support supervised control: missing consumer-v1"},
-		{"limit", &core.RefusedError{Op: "run", Reason: core.RefusedLimit, Detail: "at most 16 runners"},
-			"alpha/.groundhog: refused: too many runners: at most 16 runners"},
-		{"not ours", &core.RefusedError{Op: "stop", Reason: core.RefusedNotOurs, Detail: "this session holds no token for it, so there is nothing to stop"},
-			"alpha/.groundhog: refused: no token of this session's controls it: this session holds no token for it, so there is nothing to stop"},
-		{"stop left it held", &core.StopError{Instance: "/r/alpha/.groundhog", Why: "stop had not finished after 30s; the runner (pid 7) did not end after stop and SIGTERM and was left running"},
-			"alpha/.groundhog: not released: stop had not finished after 30s; the runner (pid 7) did not end after stop and SIGTERM and was left running. This session still holds the instance, so Stop can be tried again"},
+		{"unsupported", &core.RefusedError{Op: "run", Reason: core.RefusedUnsupported, Detail: "lacks required capabilities: handlers-v1"},
+			"alpha/.groundhog: refused: not supported: lacks required capabilities: handlers-v1"},
+		{"paused", &core.RefusedError{Op: "retry", Reason: core.RefusedPaused, Detail: "Unpause instance first"},
+			"alpha/.groundhog: refused: the instance is paused: Unpause instance first"},
 		{"quitting", &core.RefusedError{Op: "run", Reason: core.RefusedClosing}, "alpha/.groundhog: refused: quitting"},
-		{"busy after retries", &groundhog.ExitError{Command: "stop", Code: 4, Kind: groundhog.KindBusy},
-			"alpha/.groundhog: still busy after retries (another operation holds the instance's lock); try again shortly"},
-		{"runner ended at startup", &core.RunnerExitedError{Instance: "/r/alpha/.groundhog", Exit: runner.Exit{Code: 2}, Log: "/state/sessions/1-x/i1.log"},
-			"alpha/.groundhog: the runner ended at startup (exit status 2) and was not started again; log: /state/sessions/1-x/i1.log"},
-		{"uncertain enroll", &groundhog.UncertainEnrollError{},
-			"alpha/.groundhog: the enroll ended without a certain outcome; the token is kept and nothing was started. The next Run, or the next status read, settles it"},
-		{"other failure", errors.New("start runner: fork/exec: denied"), "alpha/.groundhog: failed: start runner: fork/exec: denied"},
-		{"wrapped refusal", fmt.Errorf("outer: %w", &core.RefusedError{Op: "run", Reason: core.RefusedInconsistent, Detail: "refresh and try again"}),
-			"alpha/.groundhog: refused: status is not coherent: refresh and try again"},
+		{"busy", &groundhog.ExitError{Command: "pause", Code: 4, Kind: groundhog.KindBusy},
+			"alpha/.groundhog: busy (another writer holds the instance's lock); try again shortly"},
+		{"other failure", errors.New("status: exit status 6"), "alpha/.groundhog: failed: status: exit status 6"},
+		{"wrapped refusal", fmt.Errorf("outer: %w", &core.RefusedError{Op: "retry", Reason: core.RefusedNotOffered, Detail: "nothing here"}),
+			"alpha/.groundhog: refused: not offered: nothing here"},
 	}
 	for _, c := range cases {
 		err := ActionFailure(l, c.err)
@@ -508,15 +477,14 @@ func TestOutcomeTextIsExact(t *testing.T) {
 	if ActionFailure(l, nil) != nil {
 		t.Error("nil error gave a failure")
 	}
-
 	texts := map[string]string{
-		RunText(l, core.RunResult{Outcome: core.RunStarted, PID: 7}):                                 "alpha/.groundhog: runner started (pid 7), status has not shown it running yet; checking again",
-		RunText(l, core.RunResult{Outcome: core.RunStarted, PID: 7, Seen: true, ClearedPause: true}): "alpha/.groundhog: runner started (pid 7), status shows it running; a pause was cleared",
-		RunText(l, core.RunResult{Outcome: core.RunResumed, ClearedPause: true}):                     "alpha/.groundhog: resumed; the runner was already running; a pause was cleared",
-		RunText(l, core.RunResult{Outcome: core.RunAlreadyRunning}):                                  "alpha/.groundhog: already running; nothing changed",
-		StopText(l, core.StopResult{}):                                                               "alpha/.groundhog: stopped and released. The runner has ended and nothing owns the instance now, so another supervisor may take it, and Run enrolls it for this session again; deliveries already pending stay pending",
-		StopText(l, core.StopResult{Terminated: true, Why: "stop had not finished after 30s"}):       "alpha/.groundhog: stopped and released. The runner has ended and nothing owns the instance now, so another supervisor may take it, and Run enrolls it for this session again; deliveries already pending stay pending. It needed SIGTERM (stop had not finished after 30s): a consumer call the runner was waiting on, if any, stays uncertain until it is recovered",
-		StopText(l, core.StopResult{Why: "stop failed: exit status 6"}):                              "alpha/.groundhog: stopped and released. The runner has ended and nothing owns the instance now, so another supervisor may take it, and Run enrolls it for this session again; deliveries already pending stay pending. Stop reported a problem on the way (stop failed: exit status 6)",
+		RunText(l, core.RunResult{Already: true}):                          "alpha/.groundhog: already ticked by this session; nothing changed",
+		RunText(l, core.RunResult{}):                                       "alpha/.groundhog: ticking every minute; the first tick has not finished yet",
+		RunText(l, core.RunResult{Ticked: true, TickErr: errors.New("x")}): "alpha/.groundhog: ticking every minute; the first tick reported a problem: x",
+		StopText(l, core.StopResult{}):                                     "alpha/.groundhog: this session was not ticking it; nothing changed",
+		RetryText(l, core.RetryResult{Gone: []string{"out/x"}}):            "alpha/.groundhog: nothing to run for out/x",
+		RetryText(l, core.RetryResult{Busy: []string{"out/x", "out/y"}}):   "alpha/.groundhog: busy: nothing was started for out/x, out/y (its run is going, or the instance's lock was held); try again shortly",
+		RetryText(l, core.RetryResult{Started: []string{"out/y"}, Failed: []core.RetryFailure{{Delivery: "out/x", Err: errors.New("exit 6")}}}): "alpha/.groundhog: 1 run started again (out/y); could not start out/x (exit 6)",
 	}
 	for got, want := range texts {
 		if got != want {
@@ -528,68 +496,41 @@ func TestOutcomeTextIsExact(t *testing.T) {
 // A refusal arrives as a failure notice in the status line, and the reread still
 // happens so the view reconciles with what the protocol says.
 func TestRefusalShowsAsAFailureAndRereads(t *testing.T) {
-	f := &fakeRunners{run: func(key string) (core.RunResult, error) {
-		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedExternal, Detail: `owner "x" is recorded`}
+	f := &fakeControl{run: func(key string) (core.RunResult, error) {
+		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedUnsupported, Detail: "lacks handlers-v1"}
 	}}
 	r := newRig(t, f)
-	r.send(typeText(":run")...)
-	msgs := r.send(key(tea.KeyEnter))
-	r.send(msgs...)
-	want := `Run: alpha: refused: owned by another supervisor: owner "x" is recorded`
-	if r.m.notice != want || !r.m.failure {
-		t.Fatalf("notice %q failure %v", r.m.notice, r.m.failure)
+	want := "Run: alpha: refused: not supported: lacks handlers-v1"
+	if got := r.do("run"); got != want || !r.m.failure {
+		t.Fatalf("notice %q failure %v", got, r.m.failure)
 	}
-	if !strings.Contains(r.screen(), "! "+want[:60]) {
+	if !strings.Contains(r.screen(), "! "+want) {
 		t.Fatalf("not in the status line:\n%s", r.screen())
 	}
-	if len(r.reread) != 1 {
-		t.Fatalf("reread %v", r.reread)
-	}
-	if len(r.m.busy) != 0 {
-		t.Fatal("still busy after a refusal")
-	}
-}
-
-// An enroll that ended without a certain outcome shows what happened and what
-// settles it.
-func TestUncertainEnrollIsShown(t *testing.T) {
-	f := &fakeRunners{run: func(key string) (core.RunResult, error) {
-		return core.RunResult{Instance: key}, &groundhog.UncertainEnrollError{}
-	}}
-	r := newRig(t, f)
-	r.send(typeText(":run")...)
-	r.send(r.send(key(tea.KeyEnter))...)
-	want := "Run: alpha: the enroll ended without a certain outcome; the token is kept and nothing was started. The next Run, or the next status read, settles it"
-	if r.m.notice != want || !r.m.failure {
-		t.Fatalf("notice %q failure %v", r.m.notice, r.m.failure)
+	if len(r.reread) != 1 || len(r.m.busy) != 0 {
+		t.Fatalf("reread %v busy %v", r.reread, r.m.busy)
 	}
 }
 
 // The selection holds while a Run is under way and across refreshes, and a
 // result for an instance that is no longer selected does not move it.
 func TestSelectionHoldsDuringARefreshAndAnActionInFlight(t *testing.T) {
-	f := &fakeRunners{release: make(chan struct{})}
+	f := &fakeControl{release: make(chan struct{})}
 	r := newRig(t, f)
 	r.send(typeText(":run")...)
 	next, cmd := r.m.Update(key(tea.KeyEnter))
 	r.m = next.(Model)
 	alpha, bravo := "/r/alpha/.groundhog", "/r/bravo/.groundhog"
-
 	r.send(key(tea.KeyDown)) // bravo, while alpha's Run is under way
-	if r.m.selectedInstance() != bravo || r.names() != "Stop,Open folder,Refresh,Quit" {
+	if r.m.selectedInstance() != bravo || r.names() != "Stop,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("selected %q offers %s", r.m.selectedInstance(), r.names())
 	}
-	// A refresh reorders and adds instances; bravo stays selected, alpha stays busy.
-	r.send(SnapshotMsg{Data: r.data(unowned("aaa"), unowned("alpha"), ours("bravo", groundhog.RunnerRunning, false))})
+	r.send(SnapshotMsg{Data: r.data(supported("aaa"), supported("alpha"), supported("bravo"))})
 	if r.m.selectedInstance() != bravo {
 		t.Fatalf("selection moved to %q", r.m.selectedInstance())
 	}
 	if _, busy := r.m.busy[alpha]; !busy || !strings.Contains(r.screen(), "Running alpha…") {
 		t.Fatalf("alpha's Run is not shown as under way:\n%s", r.screen())
-	}
-	// Bravo can still be paused meanwhile: only the instance under way is held.
-	if r.names() != "Stop,Open folder,Refresh,Quit" {
-		t.Fatalf("bravo offers %s", r.names())
 	}
 	close(f.release)
 	r.send(cmd())
@@ -598,46 +539,39 @@ func TestSelectionHoldsDuringARefreshAndAnActionInFlight(t *testing.T) {
 	}
 }
 
-// A palette opened on one instance runs Run on it even if a refresh makes the
-// selection land elsewhere; that rule (palette-target-binding) still holds with
-// the real handler, and an action in flight does not rebind it.
+// A palette opened on one instance acts on it or not at all, even if a refresh
+// makes the selection land elsewhere.
 func TestBoundInstanceSurvivesWhileSomethingIsInFlight(t *testing.T) {
-	f := &fakeRunners{}
+	f := &fakeControl{}
 	r := newRig(t, f)
-	r.send(typeText(":pl")...)
-	// alpha vanishes behind the open palette; bravo (running) takes the selection.
-	r.send(SnapshotMsg{Data: r.data(ours("bravo", groundhog.RunnerRunning, false))})
+	r.send(typeText(":ru")...)
+	r.send(SnapshotMsg{Data: r.data(supported("bravo"))}) // alpha vanishes behind the open palette
 	r.send(key(tea.KeyEnter))
-	if p, n := f.counts(); p != 0 || n != 0 {
-		t.Fatalf("an action ran on the wrong instance: runs %d stops %d", p, n)
-	}
-	if !strings.Contains(r.m.notice, "Nothing ran:") {
-		t.Fatalf("notice %q", r.m.notice)
+	if f.list() != "" || !strings.Contains(r.m.notice, "Nothing ran:") {
+		t.Fatalf("calls %q notice %q", f.list(), r.m.notice)
 	}
 }
 
-// Quit never goes through the runners handler: the shell quits, and main ends
-// in core.Supervisor.Quit for every way out.
-func TestQuitDoesNotTouchTheRunners(t *testing.T) {
-	f := &fakeRunners{}
+// Quit never goes through the control handler: the shell quits, and main ends
+// in core.Ticker.Quit for every way out.
+func TestQuitDoesNotTouchTheControl(t *testing.T) {
+	f := &fakeControl{}
 	r := newRig(t, f)
 	r.send(typeText(":quit")...)
-	_, cmd := r.m.Update(key(tea.KeyEnter))
-	if !quits(cmd) {
+	if _, cmd := r.m.Update(key(tea.KeyEnter)); !quits(cmd) {
 		t.Fatal("palette Quit did not quit")
 	}
-	_, cmd = r.m.Update(key(tea.KeyCtrlC))
-	if !quits(cmd) {
+	if _, cmd := r.m.Update(key(tea.KeyCtrlC)); !quits(cmd) {
 		t.Fatal("ctrl+c did not quit")
 	}
-	if p, n := f.counts(); p != 0 || n != 0 {
-		t.Fatalf("runs %d stops %d", p, n)
+	if f.list() != "" {
+		t.Fatalf("calls %q", f.list())
 	}
 }
 
 // Bare keys still start nothing with the real handler installed.
-func TestBareKeysNeverReachTheRunners(t *testing.T) {
-	f := &fakeRunners{}
+func TestBareKeysNeverReachTheControl(t *testing.T) {
+	f := &fakeControl{}
 	r := newRig(t, f)
 	for _, k := range []tea.Msg{key(tea.KeyEnter), key(tea.KeySpace), key(tea.KeyRight), tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")}, key(tea.KeyTab)} {
@@ -645,35 +579,32 @@ func TestBareKeysNeverReachTheRunners(t *testing.T) {
 			t.Fatalf("key %v produced %v", k, msgs)
 		}
 	}
-	if p, n := f.counts(); p != 0 || n != 0 {
-		t.Fatalf("runs %d stops %d", p, n)
+	if f.list() != "" {
+		t.Fatalf("calls %q", f.list())
 	}
 }
 
 // The status line holds one line and cuts a long reason; the whole outcome stays
 // in the preview of the instance it was about, until that instance is acted on again.
 func TestLongRefusalStaysWholeInThePreview(t *testing.T) {
-	detail := `owner "other" is recorded; ownership and runner liveness are separate, and a stopped owner is not available for takeover`
-	f := &fakeRunners{run: func(key string) (core.RunResult, error) {
-		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedExternal, Detail: detail}
+	detail := strings.Repeat("a long reason that goes on ", 6)
+	f := &fakeControl{run: func(key string) (core.RunResult, error) {
+		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedUnsupported, Detail: detail}
 	}}
 	r := newRig(t, f)
 	r.m, _ = feed(r.m, tea.WindowSizeMsg{Width: 80, Height: 24})
-	r.send(typeText(":run")...)
-	r.send(r.send(key(tea.KeyEnter))...)
+	r.do("run")
 	whole := func() string {
 		return strings.Join(strings.Fields(ansi.Strip(strings.Join(r.m.previewLines(40), "\n"))), " ")
 	}
-	if want := "Last action: Run: alpha: refused: owned by another supervisor: " + detail; !strings.Contains(whole(), want) {
+	if want := "Last action: Run: alpha: refused: not supported: " + strings.TrimSpace(detail); !strings.Contains(whole(), want) {
 		t.Fatalf("preview lacks the whole refusal:\n%s", whole())
 	}
-	// Another instance's preview does not carry it.
 	r.send(key(tea.KeyDown))
 	if strings.Contains(whole(), "Last action") {
 		t.Fatalf("bravo's preview shows alpha's outcome:\n%s", whole())
 	}
 	r.send(key(tea.KeyUp))
-	// Acting on the instance again clears the old outcome while the new one is under way.
 	r.send(typeText(":run")...)
 	r.send(key(tea.KeyEnter)) // its answer has not been fed back: the action is under way
 	if strings.Contains(whole(), "Last action") {
@@ -681,39 +612,48 @@ func TestLongRefusalStaysWholeInThePreview(t *testing.T) {
 	}
 }
 
-// A runner killed by a signal skips its exit trap, so status reads "unknown"
-// (or still "running", before the next read). When the supervisor saw its child
-// end, Run is offered whatever status says the runner state is.
-func TestRunIsOfferedAfterThisSessionSawItsRunnerEnd(t *testing.T) {
-	for _, state := range []groundhog.RunnerState{groundhog.RunnerUnknown, groundhog.RunnerRunning, groundhog.RunnerStopped, groundhog.RunnerFailed} {
-		v := ours("x", state, false)
-		key := v.Instance.Path
-		exited := map[string]core.RunnerInfo{key: {Instance: key, Phase: core.PhaseExited, Notice: "runner ended on its own (killed) and was not restarted"}}
-		if got := actionsOf(t, v, exited); got != "run,stop" {
-			t.Errorf("runner %s, exited: offered %q, want run,stop", state, got)
+// A tick that failed keeps the row running, says so in the detail, and gives
+// the error in the preview; the loop goes on.
+func TestATickThatFailedIsShownAndTheRowStaysRunning(t *testing.T) {
+	v := supported("x")
+	look := func(string) (core.TickInfo, bool) {
+		return core.TickInfo{Ticking: true, Interval: core.DefaultTickInterval, LastBegan: at, LastEnded: at,
+			LastErr: errors.New("groundhog tick: exit 1 (unexpected exit): firing failed")}, true
+	}
+	n := FromViewWith(core.View{Instances: []core.InstanceView{v}}, look).Nodes[0]
+	if n.State != StateRunning || !strings.Contains(n.Detail, "the last tick failed") ||
+		!strings.Contains(n.Preview, "its last tick began at 09:30:15 and failed: groundhog tick: exit 1") {
+		t.Fatalf("%+v", n)
+	}
+}
+
+func strp(s string) *string { return &s }
+
+// delivery is a delivery at path in state, fired from item ("" for none).
+func delivery(path string, state groundhog.DeliveryState, item string) groundhog.Delivery {
+	d := groundhog.Delivery{Path: path, State: state, Run: true}
+	if item != "" {
+		d.SchedulePath = strp(item)
+	}
+	return d
+}
+
+func withDeliveries(v core.InstanceView, dels ...groundhog.Delivery) core.InstanceView {
+	st := v.Inspection.Last.Status
+	st.Deliveries = append(append([]groundhog.Delivery(nil), st.Deliveries...), dels...)
+	v.Inspection.Last = obs(st)
+	return v
+}
+
+// toggleCalls lists the item toggles asked of f, as "item <instance> <path> <pause>".
+func (f *fakeControl) toggleCalls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "item ") {
+			out = append(out, c)
 		}
 	}
-	// Without the supervisor's word, an unknown runner is not offered anything,
-	// and a runner this session has not seen end keeps Stop.
-	unknown := ours("x", groundhog.RunnerUnknown, false)
-	if got := actionsOf(t, unknown, nil); got != "" {
-		t.Errorf("unknown runner, no word from the supervisor: offered %q", got)
-	}
-	running := ours("x", groundhog.RunnerRunning, false)
-	live := map[string]core.RunnerInfo{running.Instance.Path: {Instance: running.Instance.Path, Phase: core.PhaseRunning}}
-	if got := actionsOf(t, running, live); got != "stop" {
-		t.Errorf("live runner: offered %q, want stop", got)
-	}
-	// An exit does not override what makes any status untrustworthy, or an
-	// instance that is not this session's.
-	stale := ours("x", groundhog.RunnerUnknown, false)
-	stale.Health = core.HealthStale
-	if got := actionsOf(t, stale, map[string]core.RunnerInfo{stale.Instance.Path: {Phase: core.PhaseExited}}); got != "" {
-		t.Errorf("stale status, exited runner: offered %q", got)
-	}
-	ext := ours("x", groundhog.RunnerUnknown, false)
-	ext.Class = core.ClassExternal
-	if got := actionsOf(t, ext, map[string]core.RunnerInfo{ext.Instance.Path: {Phase: core.PhaseExited}}); got != "" {
-		t.Errorf("external instance, exited runner: offered %q", got)
-	}
+	return out
 }

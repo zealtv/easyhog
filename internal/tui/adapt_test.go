@@ -18,7 +18,7 @@ var at = time.Date(2026, 11, 15, 9, 30, 15, 0, time.UTC)
 func obs(st groundhog.Status) *core.Observation { return &core.Observation{Status: st, TakenAt: at} }
 
 func okStatus() groundhog.Status {
-	return groundhog.Status{Consistent: true, Revision: 3, Runner: groundhog.Runner{State: groundhog.RunnerStopped}}
+	return groundhog.Status{ProtocolVersion: groundhog.ProtocolVersion, ObservedAt: at}
 }
 
 func iv(name string, class core.Class, health core.Health, in core.Inspection) core.InstanceView {
@@ -28,22 +28,19 @@ func iv(name string, class core.Class, health core.Health, in core.Inspection) c
 
 func TestFromViewDistinguishesEveryKindOfInstance(t *testing.T) {
 	good := obs(okStatus())
-	owned := okStatus()
-	owned.Owner = &groundhog.Owner{ID: "o-1", Label: "other-supervisor"}
-	bad := okStatus()
-	bad.Consistent = false
+	outside := okStatus()
+	outside.LastTick = &groundhog.LastTick{At: at.Add(-20 * time.Second), Source: "standalone"}
 	malformed := iv("malformed", core.ClassMalformed, core.HealthOK, core.Inspection{})
 	malformed.Instance.Malformed = []string{"groundhog.sh is missing"}
 	view := core.View{Root: "/r", Instances: []core.InstanceView{
 		iv("fresh", core.ClassNotInspected, core.HealthOK, core.Inspection{}),
-		iv("unowned", core.ClassUnowned, core.HealthOK, core.Inspection{Last: good}),
-		iv("external", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(owned)}),
+		iv("supported", core.ClassSupported, core.HealthOK, core.Inspection{Last: good}),
+		iv("external", core.ClassSupported, core.HealthOK, core.Inspection{Last: obs(outside)}),
 		iv("legacy", core.ClassLegacy, core.HealthOK, core.Inspection{Support: &groundhog.Support{Reason: "lacks required capabilities: x"}}),
 		iv("partial", core.ClassUnsupported, core.HealthOK, core.Inspection{Last: good}),
-		iv("failing", core.ClassUnowned, core.HealthOK, core.Inspection{Last: good, Err: errors.New("deadline"), ErrAt: at}),
+		iv("failing", core.ClassSupported, core.HealthOK, core.Inspection{Last: good, Err: errors.New("deadline"), ErrAt: at}),
 		iv("neverread", core.ClassFailing, core.HealthOK, core.Inspection{Err: errors.New("exit 6"), ErrAt: at}),
-		iv("stale", core.ClassUnowned, core.HealthStale, core.Inspection{Last: good}),
-		iv("inconsistent", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(bad), Attempts: 3}),
+		iv("stale", core.ClassSupported, core.HealthStale, core.Inspection{Last: good}),
 		malformed,
 	}}
 	d := FromView(view)
@@ -51,16 +48,15 @@ func TestFromViewDistinguishesEveryKindOfInstance(t *testing.T) {
 		state State
 		in    string
 	}{
-		"fresh":        {StateStopped, "not inspected"},
-		"unowned":      {StateStopped, "inspected 09:30:15"},
-		"external":     {StateExternal, "owned by other-supervisor"},
-		"legacy":       {StateUnsupported, "legacy"},
-		"partial":      {StateUnsupported, "read-only"},
-		"failing":      {StateFailed, "last good 09:30:15"},
-		"neverread":    {StateFailed, "failed"},
-		"stale":        {StateStopped, "(stale)"},
-		"inconsistent": {StateInconsistent, "inconsistent"},
-		"malformed":    {StateUnsupported, "not run"},
+		"fresh":     {StateStopped, "not inspected"},
+		"supported": {StateStopped, "not ticked, inspected 09:30:15"},
+		"external":  {StateExternal, "ticked from outside Easyhog"},
+		"legacy":    {StateUnsupported, "legacy"},
+		"partial":   {StateUnsupported, "read-only"},
+		"failing":   {StateFailed, "last good 09:30:15"},
+		"neverread": {StateFailed, "failed"},
+		"stale":     {StateStopped, "stale"},
+		"malformed": {StateUnsupported, "not run"},
 	}
 	if len(d.Nodes) != len(want) {
 		t.Fatalf("%d nodes", len(d.Nodes))
@@ -86,13 +82,10 @@ func TestFromViewDistinguishesEveryKindOfInstance(t *testing.T) {
 	if p := byLabel("failing").Preview; !strings.Contains(p, "Error at 09:30:15: deadline") || !strings.Contains(p, "the last status that could be read") {
 		t.Errorf("failing preview hides the error or the kept snapshot:\n%s", p)
 	}
-	if p := byLabel("inconsistent").Preview; !strings.Contains(p, "inconsistent status after 3 reads") {
-		t.Errorf("inconsistent preview:\n%s", p)
-	}
 	if p := byLabel("fresh").Preview; !strings.Contains(p, "nothing was run") {
 		t.Errorf("fresh preview:\n%s", p)
 	}
-	if p := byLabel("external").Preview; !strings.Contains(p, "other-supervisor") {
+	if p := byLabel("external").Preview; !strings.Contains(p, "Pending work: probably, something outside Easyhog ticked it 20s before") {
 		t.Errorf("external preview:\n%s", p)
 	}
 }
@@ -102,7 +95,7 @@ func TestFromViewKeepsItemKeysWhenStatusArrivesAfterTheListing(t *testing.T) {
 	listed.Files = discovery.Glance{Schedule: []discovery.ScheduleDir{{Path: "daily", Leaf: false}, {Path: "daily/x", Leaf: true}}}
 	st := okStatus()
 	st.Schedule = []groundhog.ScheduleItem{{Path: "schedule/daily/x", ItemID: "x"}}
-	read := iv("a", core.ClassUnowned, core.HealthOK, core.Inspection{Last: obs(st)})
+	read := iv("a", core.ClassSupported, core.HealthOK, core.Inspection{Last: obs(st)})
 	read.Files = listed.Files
 
 	before := FromView(core.View{Instances: []core.InstanceView{listed}}).Nodes[0].Children
@@ -219,29 +212,23 @@ func TestRefreshRunsOnlyFromThePalette(t *testing.T) {
 	}
 }
 
-// A runner kept alive by a pause reads paused: true with runner.state: running.
-// This session's instance then shows "paused", not "running"; an external or
-// unowned instance keeps the generic word for its class.
-func TestFromViewShowsThisSessionsPausedRunnerAsPaused(t *testing.T) {
-	ext := okStatus()
-	ext.Owner = &groundhog.Owner{ID: "other", Label: "other"}
-	ext.Runner.State, ext.Paused = groundhog.RunnerRunning, true
-	unow := okStatus()
-	unow.Paused = true
+// The instance pause outranks who ticks it: a paused instance reads paused,
+// ticked here or not, and says whether this session still ticks it.
+func TestFromViewShowsAPausedInstanceAsPaused(t *testing.T) {
 	cases := []struct {
 		name  string
 		v     core.InstanceView
+		look  TickLookup
 		state State
 		word  string
 	}{
-		{"ours-running", ours("a", groundhog.RunnerRunning, false), StateRunning, "running"},
-		{"ours-paused", ours("b", groundhog.RunnerRunning, true), StatePaused, "paused"},
-		{"external-paused", iv("c", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(ext)}), StateExternal, "owned by other"},
-		{"unowned-paused", iv("d", core.ClassUnowned, core.HealthOK, core.Inspection{Last: obs(unow)}), StateStopped, "not enrolled"},
+		{"ticked here", supported("a"), ticks("/r/a/.groundhog"), StateRunning, "inspected 09:30:15"},
+		{"ticked here, paused", pausedInstance("b"), ticks("/r/b/.groundhog"), StatePaused, "nothing fires or starts; this session still ticks it"},
+		{"not ticked here, paused", pausedInstance("c"), ticks(), StatePaused, "nothing fires or starts, inspected"},
+		{"not ticked here", supported("d"), ticks(), StateStopped, "not ticked"},
 	}
 	for _, c := range cases {
-		d := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, lookup(nil))
-		n := d.Nodes[0]
+		n := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, c.look).Nodes[0]
 		if n.State != c.state || !strings.Contains(n.Detail, c.word) {
 			t.Errorf("%s: state %v detail %q, want %v containing %q", c.name, n.State, n.Detail, c.state, c.word)
 		}
@@ -249,51 +236,21 @@ func TestFromViewShowsThisSessionsPausedRunnerAsPaused(t *testing.T) {
 	if StatePaused.label() != "paused" || StatePaused.glyph() == StateRunning.glyph() || StatePaused.glyph() == StatePending.glyph() {
 		t.Errorf("paused needs its own word and glyph: %q %q", StatePaused.label(), StatePaused.glyph())
 	}
-}
-
-// An instance this session owns whose runner is not
-// running read "not enrolled", though Quit will stop and release it. The row says
-// what holds, and an adopted instance says so before it has been inspected.
-func TestFromViewNamesAnOwnedInstanceWithoutARunner(t *testing.T) {
-	const key = "/r/a/.groundhog"
-	adopted := core.RunnerInfo{Instance: key, Phase: core.PhaseEnrolled, Adopted: true}
-	cases := []struct {
-		name  string
-		v     core.InstanceView
-		infos map[string]core.RunnerInfo
-		word  string
-	}{
-		{"stopped", ours("a", groundhog.RunnerStopped, false), nil, "enrolled, no runner"},
-		{"runner failed", ours("a", groundhog.RunnerFailed, false), nil, "enrolled, no runner"},
-		{"unknown (adopted, its runner died)", ours("a", groundhog.RunnerUnknown, false), map[string]core.RunnerInfo{key: adopted}, "enrolled, no runner"},
-		{"stopping", ours("a", groundhog.RunnerStopping, false), nil, "runner stopping"},
-		{"adopted, not inspected", iv("a", core.ClassNotInspected, core.HealthOK, core.Inspection{}), map[string]core.RunnerInfo{key: adopted}, "adopted, not inspected"},
-		{"not adopted, not inspected", iv("a", core.ClassNotInspected, core.HealthOK, core.Inspection{}), nil, "not inspected"},
-	}
-	for _, c := range cases {
-		n := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, lookup(c.infos)).Nodes[0]
-		if n.State != StateStopped || !strings.HasPrefix(n.Detail, c.word) {
-			t.Errorf("%s: state %v detail %q, want it to start %q", c.name, n.State, n.Detail, c.word)
-		}
-		if strings.Contains(n.Detail, "not enrolled") {
-			t.Errorf("%s: detail %q says not enrolled for an instance this session holds", c.name, n.Detail)
-		}
-	}
-	// An unowned instance still reads "not enrolled".
-	if n := FromViewWith(core.View{Instances: []core.InstanceView{unowned("u")}}, lookup(nil)).Nodes[0]; !strings.HasPrefix(n.Detail, "not enrolled") {
-		t.Errorf("unowned detail %q", n.Detail)
+	if p := FromViewWith(core.View{Instances: []core.InstanceView{pausedInstance("p")}}, ticks()).Nodes[0].Preview; !strings.Contains(p, "Pause: the instance is paused") {
+		t.Errorf("preview:\n%s", p)
 	}
 }
 
 // The header counts paused instances beside running ones, only when there are any.
 func TestHeaderCountsPausedInstances(t *testing.T) {
-	v := core.View{Root: "/r", Instances: []core.InstanceView{ours("a", groundhog.RunnerRunning, false), ours("b", groundhog.RunnerRunning, true)}}
-	m, _ := feed(NewWithData(FromViewWith(v, lookup(nil))), tea.WindowSizeMsg{Width: 100, Height: 30})
+	v := core.View{Root: "/r", Instances: []core.InstanceView{supported("a"), pausedInstance("b")}}
+	look := ticks("/r/a/.groundhog", "/r/b/.groundhog")
+	m, _ := feed(NewWithData(FromViewWith(v, look)), tea.WindowSizeMsg{Width: 100, Height: 30})
 	if h := m.header(100); !strings.Contains(h, "2 instances · 1 running · 1 paused") {
 		t.Errorf("header %q", h)
 	}
 	v.Instances = v.Instances[:1]
-	m, _ = feed(NewWithData(FromViewWith(v, lookup(nil))), tea.WindowSizeMsg{Width: 100, Height: 30})
+	m, _ = feed(NewWithData(FromViewWith(v, look)), tea.WindowSizeMsg{Width: 100, Height: 30})
 	if h := m.header(100); strings.Contains(h, "paused") {
 		t.Errorf("header %q mentions paused", h)
 	}

@@ -16,9 +16,9 @@ import (
 const (
 	// DefaultInterval is how often the selected instance's status is re-read.
 	// Five seconds keeps the terminal current enough for a viewer whose state
-	// changes by minutes (schedules, handoffs, pauses), while one `status` run
-	// costs a few milliseconds on a small journal and, as measured,
-	// about 8 ms per delivery record on a large one: the interval
+	// changes by minutes (schedules, runs, pauses), while one `status` run
+	// costs a few milliseconds on a small instance and, as measured on
+	// Groundhog's protocol 1, about 8 ms per delivery record on a large one: the interval
 	// stretches to four times the last call's duration so that even a slow
 	// instance spends at most a fifth of its time answering us.
 	DefaultInterval = 5 * time.Second
@@ -29,17 +29,13 @@ const (
 	// runs nothing.
 	DefaultDiscoverEvery = 30 * time.Second
 	// DefaultCallTimeout bounds each script call the refresher makes, passed per
-	// call (the shared client's own default, 30 s, stays for the supervisor's
+	// call (the shared client's own default, 30 s, stays for the ticker's
 	// calls). Half the client's default: a status that takes this long is itself
 	// the finding to show.
 	DefaultCallTimeout = 15 * time.Second
 	// DefaultConcurrency bounds simultaneous script calls, which only an
 	// explicit Refresh over many instances approaches.
 	DefaultConcurrency = 4
-	// DefaultRetries is how many times a `consistent:false` status is re-read
-	// before it is kept and shown as inconsistent (three reads in all).
-	DefaultRetries    = 2
-	DefaultRetryDelay = 300 * time.Millisecond
 
 	// staleAfterIntervals: the selected instance counts as stale once its last
 	// read is older than this many intervals.
@@ -47,7 +43,7 @@ const (
 )
 
 // Config holds the refresher's dependencies and bounds. Zero values select the
-// defaults above; Retries below zero means none.
+// defaults above.
 type Config struct {
 	// Root is the canonical search root (Snapshot.Root from Open).
 	Root string
@@ -57,9 +53,9 @@ type Config struct {
 	// Exec runs the instances' own scripts, by absolute path.
 	Exec  runner.Executor
 	Clock Clock
-	// Clients is the pool of one client per instance. Pass the supervisor's
-	// (SupervisorConfig.Clients) so both share each instance's capability
-	// cache; nil makes a pool of its own over Exec.
+	// Clients is the pool of one client per instance. Pass the ticker's
+	// (TickerConfig.Clients) so both share each instance's capability cache;
+	// nil makes a pool of its own over Exec.
 	Clients *Clients
 
 	Interval      time.Duration
@@ -67,18 +63,6 @@ type Config struct {
 	DiscoverEvery time.Duration
 	CallTimeout   time.Duration
 	Concurrency   int
-	Retries       int
-	RetryDelay    time.Duration
-
-	// IsOurs says whether an owner record belongs to this session: whether a
-	// token in the session's directory matches it (Supervisor.IsOurs). Nil means
-	// never: every owner is external.
-	IsOurs func(groundhog.Owner) bool
-	// OnCoherent, if set, is called with each coherent status the refresher has
-	// just recorded, outside its locks, so the supervisor can apply the ownership
-	// rule to a token it holds (Supervisor.Observe). It runs on the read's own
-	// goroutine and may take as long as one more status call.
-	OnCoherent func(ctx context.Context, instance string, st groundhog.Status)
 }
 
 func (c *Config) fill() {
@@ -99,15 +83,6 @@ func (c *Config) fill() {
 	}
 	if c.Concurrency <= 0 {
 		c.Concurrency = DefaultConcurrency
-	}
-	switch {
-	case c.Retries == 0:
-		c.Retries = DefaultRetries
-	case c.Retries < 0:
-		c.Retries = 0
-	}
-	if c.RetryDelay <= 0 {
-		c.RetryDelay = DefaultRetryDelay
 	}
 }
 
@@ -229,7 +204,7 @@ func (r *Refresher) Refresh() {
 }
 
 // Reinspect reads one instance's capabilities and status now, without waiting
-// for the interval: the reader has just acted on it (Run, Stop), so what the
+// for the interval: the reader has just acted on it (Run, Retry, a pause), so what the
 // terminal shows should catch up with protocol status. It returns at once, runs
 // only that instance's script (the one the reader just acted on) and, if a read
 // is already in flight, queues one more behind it, since the read in flight may
@@ -467,8 +442,7 @@ func sameDiags(a, b []discovery.Diagnostic) bool {
 }
 
 // inspect reads one instance: a fresh glance, a capability negotiation when
-// needed, then `status --json`, re-read a bounded number of times while it
-// reports itself inconsistent.
+// needed, then `status --json`.
 func (r *Refresher) inspect(ctx context.Context, e *entry, explicit bool) {
 	defer func() {
 		r.mu.Lock()
@@ -534,28 +508,12 @@ func (r *Refresher) inspect(ctx context.Context, e *entry, explicit bool) {
 		return
 	}
 
-	st, attempts, ok, err := readCoherent(ctx, client, readPolicy{
-		Tries: r.cfg.Retries + 1, Delay: r.cfg.RetryDelay, Opts: []groundhog.Option{r.callTimeout()},
-		Wait: func(ctx context.Context, d time.Duration) error {
-			select {
-			case <-clk.After(d):
-				return nil
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		},
-	})
-	switch {
-	case err != nil:
+	st, err := client.Status(ctx, r.callTimeout())
+	if err != nil {
 		r.fail(ctx, e, err, began)
 		return
-	case !ok && ctx.Err() != nil:
-		return // cut short while waiting to re-read: nothing worth keeping
 	}
-	r.record(e, st, attempts, began)
-	if ok && r.cfg.OnCoherent != nil {
-		r.cfg.OnCoherent(ctx, path, st)
-	}
+	r.record(e, st, began)
 }
 
 // callTimeout is the refresher's bound on one script call, shorter than the
@@ -592,14 +550,13 @@ func (r *Refresher) fail(ctx context.Context, e *entry, err error, began time.Ti
 // record stores a read and announces it. Every completed read signals: the
 // signal channel holds one pending signal, so a burst of reads costs the
 // terminal one rebuild, and a rebuild that was not needed costs less than a view
-// that should have changed and did not (a runner killed by a signal reads as
-// unknown without any counter moving).
-func (r *Refresher) record(e *entry, st groundhog.Status, attempts int, began time.Time) {
+// that should have changed and did not (a run that ended moves no count).
+func (r *Refresher) record(e *entry, st groundhog.Status, began time.Time) {
 	now := r.cfg.Clock.Now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e.insp.Last = &Observation{Status: st, TakenAt: now}
-	e.insp.Err, e.insp.Attempts = nil, attempts
+	e.insp.Err = nil
 	e.attempted, e.fails = true, 0
 	e.setNext(r.cfg, now, began)
 	r.signal()
@@ -633,25 +590,10 @@ func (r *Refresher) classify(e *entry) Class {
 		return ClassFailing
 	case in.Last == nil:
 		return ClassNotInspected
-	}
-	owned := in.Last.Status.Owner != nil && r.cfg.IsOurs != nil && r.cfg.IsOurs(*in.Last.Status.Owner)
-	return classifyRead(in.Last.Status, in.Support, owned)
-}
-
-// classifyRead is the class of an instance whose script answered: who owns it,
-// as the session sees it, and whether it supports supervised control. ours says
-// the recorded owner, if any, is this session's. The supervisor applies it to
-// its own fresh read, so that the rule it checks at Run is the palette's.
-func classifyRead(st groundhog.Status, sup *groundhog.Support, ours bool) Class {
-	switch {
-	case st.Owner != nil && ours:
-		return ClassOwnedBySession
-	case st.Owner != nil:
-		return ClassExternal
-	case sup != nil && !sup.Controllable:
+	case in.Support != nil && !in.Support.Controllable:
 		return ClassUnsupported
 	}
-	return ClassUnowned
+	return ClassSupported
 }
 
 func (r *Refresher) health(e *entry, selected bool, now time.Time) Health {
@@ -659,8 +601,6 @@ func (r *Refresher) health(e *entry, selected bool, now time.Time) Health {
 	switch {
 	case in.Last == nil:
 		return HealthOK // no status is shown, so there is nothing to trust or doubt
-	case !in.Last.Status.Consistent:
-		return HealthInconsistent
 	case selected && now.Sub(since(in.Last.TakenAt, r.selectedAt)) > staleAfterIntervals*r.cfg.Interval:
 		// Stale counts from the later of the last read and the moment the
 		// instance became selected: one read long ago is not "should have been

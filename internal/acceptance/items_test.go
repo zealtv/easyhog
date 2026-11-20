@@ -13,29 +13,23 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/zealtv/easyhog/internal/core"
-	"github.com/zealtv/easyhog/internal/groundhog"
 	"github.com/zealtv/easyhog/internal/tui"
 )
 
-// Pause item and Unpause item from the palette: the item's
-// folder is renamed, the row keeps its place, the real script reads the pause
-// back, and a runner that is running keeps running and stops, then resumes,
-// firing the item. The renames are on temporary instances only.
+// Pause item and Unpause item from the palette: the item's folder is renamed,
+// the row keeps its place, the real script reads the pause back, and ticking
+// goes on and skips the item, then fires it once it is unpaused. The renames are
+// on temporary instances only.
 func TestPausingAnItemFromThePalette(t *testing.T) {
 	script := gate(t)
 	w := newWorld(t, script)
 
 	mine := w.instance("pausing")
-	w.item(mine, "every/1h", "beat", "heartbeat note")
-	w.item(mine, "every/1h", "other", "other note")
-	theirs := w.instance("theirs")
-	w.item(theirs, "every/1h", "beat", "their note")
+	w.item(mine, "daily", "beat", "heartbeat note")
+	w.item(mine, "daily", "other", "other note")
 	w.start()
-	if res, err := w.osup.Run(w.ctx, theirs); err != nil || res.Outcome != core.RunStarted {
-		t.Fatalf("setup: another supervisor could not run theirs: %+v %v", res, err)
-	}
 
-	const rel = "schedule/every/1h/beat"
+	const rel = "schedule/daily/beat"
 	beat := filepath.Join(mine, filepath.FromSlash(rel))
 	paused := beat + ".paused"
 	itemKey := mine + "#" + rel
@@ -66,7 +60,7 @@ func TestPausingAnItemFromThePalette(t *testing.T) {
 		w.selectRow(label)
 	}
 
-	t.Run("an unowned instance's item is paused, and its row keeps its place", func(t *testing.T) {
+	t.Run("an item is paused, and its row keeps its place", func(t *testing.T) {
 		selectItem("beat")
 		if !lists("pause item", pauseRow) || lists("unpause", unpauseRow) {
 			t.Fatalf("a scheduled item should offer Pause item only\n%s", w.screen())
@@ -103,12 +97,11 @@ func TestPausingAnItemFromThePalette(t *testing.T) {
 		}
 	})
 
-	t.Run("a running runner skips the paused item and fires it once it is unpaused", func(t *testing.T) {
+	t.Run("ticking skips the paused item and fires it once it is unpaused", func(t *testing.T) {
 		w.selectInstance("pausing")
 		w.palette("run")
-		w.await("the runner to fire the other item", 30*time.Second, func() bool {
-			st := w.status(mine)
-			return st.Runner.State == groundhog.RunnerRunning && len(deliveriesOf(st, "other")) > 0
+		w.await("a tick to fire the other item", 30*time.Second, func() bool {
+			return len(deliveriesOf(w.status(mine), "other")) > 0
 		})
 		if n := len(deliveriesOf(w.status(mine), "beat")); n != 0 {
 			t.Fatalf("the paused item fired (%d deliveries)", n)
@@ -122,11 +115,11 @@ func TestPausingAnItemFromThePalette(t *testing.T) {
 		if _, err := os.Stat(beat); err != nil {
 			t.Fatalf("the folder was not renamed back: %v", err)
 		}
-		w.await("the unpaused item to fire under the running runner", 30*time.Second, func() bool {
+		w.await("the unpaused item to fire on a later tick", 30*time.Second, func() bool {
 			return len(deliveriesOf(w.status(mine), "beat")) > 0
 		})
-		if st := w.status(mine); st.Runner.State != groundhog.RunnerRunning || st.Owner == nil || runnerProcesses(t, mine) != 1 {
-			t.Errorf("after the rename: runner %s, owner %+v, %d processes", st.Runner.State, st.Owner, runnerProcesses(t, mine))
+		if info, _ := w.tk.Info(mine); !info.Ticking || info.LastErr != nil {
+			t.Errorf("after the rename: ticking %v, last tick's error %v", info.Ticking, info.LastErr)
 		}
 		w.reread("pausing")
 		if n := child("beat"); n.Key != itemKey || n.State == tui.StatePaused {
@@ -151,34 +144,12 @@ func TestPausingAnItemFromThePalette(t *testing.T) {
 		if got := strings.Join(labels, ","); got != "beat,beat.paused,other" {
 			t.Errorf("rows %s", got)
 		}
-		_, err := w.sup.SetItemPaused(w.ctx, mine, rel, true)
+		_, err := w.tk.SetItemPaused(w.ctx, mine, rel, true)
 		var re *core.RefusedError
 		if !errors.As(err, &re) || re.Reason != core.RefusedNotOffered {
 			t.Errorf("a stale request was not refused: %v", err)
 		}
 		w.must(os.Remove(paused))
 		w.reread("pausing")
-	})
-
-	t.Run("an item of an instance another supervisor runs is left alone", func(t *testing.T) {
-		w.selectInstance("theirs")
-		w.send(press(tea.KeyRight)) // expand
-		// "pausing" is still expanded above, with an item of the same name, so
-		// selecting by label would land there: step onto theirs' own item instead.
-		w.send(press(tea.KeyDown))
-		if !strings.Contains(w.flat(), "in theirs") || !strings.Contains(w.flat(), "Item "+rel) {
-			t.Fatalf("not on theirs' item\n%s", w.screen())
-		}
-		if lists("pause item", pauseRow) {
-			t.Fatalf("Pause item is offered on an externally owned instance\n%s", w.screen())
-		}
-		_, err := w.sup.SetItemPaused(w.ctx, theirs, rel, true)
-		var re *core.RefusedError
-		if !errors.As(err, &re) || re.Reason != core.RefusedExternal {
-			t.Fatalf("not refused as external: %v", err)
-		}
-		if _, err := os.Stat(filepath.Join(theirs, filepath.FromSlash(rel))); err != nil {
-			t.Errorf("their item moved: %v", err)
-		}
 	})
 }

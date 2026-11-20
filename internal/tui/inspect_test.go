@@ -6,8 +6,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/zealtv/easyhog/internal/core"
@@ -21,171 +23,99 @@ func sp(s string) *string { return &s }
 // failed delivery, one paused by an inherited folder, and one quiet.
 func inspected() core.InstanceView {
 	st := okStatus()
-	st.Owner = &groundhog.Owner{ID: "o-9", Label: "other-supervisor"}
 	st.Schedule = []groundhog.ScheduleItem{
 		{Path: "schedule/daily/09/report", ItemID: "report", Cadence: &groundhog.Cadence{Axis: "daily", Time: sp("09:00")},
 			EligibleNow: true, FiringAllowed: true},
 		{Path: "schedule/weekly.paused/mon/review", ItemID: "review", Cadence: &groundhog.Cadence{Axis: "weekly", Day: sp("mon"), Defaulted: true},
 			PausedBy: []string{"schedule/weekly.paused"}, BlockedBy: []string{"subtree_paused", "not_due"}},
-		{Path: "schedule/every/15m/beat", ItemID: "beat", Cadence: &groundhog.Cadence{Axis: "every", Interval: sp("15m")}, BlockedBy: []string{"owned", "mystery"}},
+		{Path: "schedule/every/15m/beat", ItemID: "beat", Cadence: &groundhog.Cadence{Axis: "every", Interval: sp("15m")}, BlockedBy: []string{"instance_paused", "mystery"}},
 	}
 	code := 3
+	started := at.Add(-time.Minute)
 	st.Deliveries = []groundhog.Delivery{
-		{Path: "out/report-2026-11-15", SchedulePath: sp("schedule/daily/09/report"), State: groundhog.DeliveryFailed, Reason: sp("consumer exited"),
-			Attempts: []groundhog.Attempt{{Outcome: "failed", ExitCode: &code, Error: &groundhog.Problem{Code: "exit", Message: "status 3"}}}},
-		{Path: "out/old", State: groundhog.DeliveryAccepted},
-		{Path: "out/waiting", State: groundhog.DeliveryPending},
+		{Path: "out/report-2026-11-15", SchedulePath: sp("schedule/daily/09/report"), State: groundhog.DeliveryFailed, Run: true, ExitStatus: &code,
+			FiredAt: &started, Log: sp("out/report-2026-11-15/.groundhog-log"),
+			Attempts: []groundhog.Attempt{{ID: sp("a-1"), StartedAt: &started, By: "tick", FinishedAt: &started, ExitStatus: &code}}},
+		{Path: "out/old", State: groundhog.DeliveryAccepted, Run: true},
+		{Path: "out/waiting", State: groundhog.DeliveryPending, Run: true},
+		{Path: "out/by hand", State: groundhog.DeliveryUnrecorded},
 	}
-	v := iv("alpha", core.ClassExternal, core.HealthOK, core.Inspection{Last: obs(st)})
-	return v
+	return iv("alpha", core.ClassSupported, core.HealthOK, core.Inspection{Last: obs(st)})
 }
 
-func TestInspectedInstanceShowsOwnershipScheduleAndDeliveries(t *testing.T) {
+func TestInspectedInstanceShowsPauseScheduleAndDeliveries(t *testing.T) {
 	n := instanceNode(inspected(), nil, false)
-	for _, want := range []string{"Ownership: another supervisor, other-supervisor (o-9)", "Pause: not paused", "Runner: stopped",
-		"Schedule: 3 items (1 due now, 0 already fired, 1 paused)", "Deliveries: 1 pending, 1 failed, 1 accepted",
-		"out/report-2026-11-15: failed (consumer exited); attempt 1 of 1 failed, exit status 3, exit: status 3", "out/waiting: pending"} {
+	for _, want := range []string{"Pause: not paused", "Schedule: 3 items (1 due now, 0 already fired, 1 paused)",
+		"Deliveries: 1 failed, 1 pending, 1 accepted, 1 unrecorded",
+		"out/report-2026-11-15: ✗ failed; attempt 1 by tick, started ", ", exit status 3; log out/report-2026-11-15/.groundhog-log",
+		"out/waiting: ◌ pending", "out/by hand: ? unrecorded"} {
 		if !strings.Contains(n.Preview, want) {
 			t.Errorf("preview lacks %q:\n%s", want, n.Preview)
 		}
 	}
-	if strings.Contains(n.Preview, "out/old") {
-		t.Error("an accepted delivery should be counted, not listed")
+	for _, gone := range []string{"out/old", "Ownership", "Runner:", "Consumer", "Revision"} {
+		if strings.Contains(n.Preview, gone) {
+			t.Errorf("preview shows %q:\n%s", gone, n.Preview)
+		}
 	}
-	// Its one failed delivery makes the row read failed, though the instance is
-	// another supervisor's.
 	if n.Badge != "3 items · 1 pending · 1 failed" || n.State != StateFailed {
 		t.Errorf("badge %q state %v", n.Badge, n.State)
 	}
 }
 
-// A status read with --active lists no settled delivery and counts them in
-// Settled; the preview and the badge give the same counts as the full read.
-func TestActiveReadShowsTheSameDeliveryCountsAsTheFullRead(t *testing.T) {
-	full := instanceNode(inspected(), nil, false)
-
-	active := inspected()
-	last := *active.Inspection.Last
-	last.Status.Deliveries = slices.DeleteFunc(slices.Clone(last.Status.Deliveries), func(d groundhog.Delivery) bool {
-		return d.State == groundhog.DeliveryAccepted
-	})
-	last.Status.Settled = &groundhog.Settled{Accepted: 1}
-	active.Inspection.Last = &last
-	n := instanceNode(active, nil, false)
-	if n.Badge != full.Badge || !strings.Contains(n.Preview, "Deliveries: 1 pending, 1 failed, 1 accepted") {
-		t.Errorf("badge %q (want %q), preview:\n%s", n.Badge, full.Badge, n.Preview)
-	}
-
-	// The reader is told what an --active read left out, in the instance preview
-	// and in each item's preview; a full read and an empty settled count say nothing.
-	const itemLine = "Settled deliveries (accepted or missing) are counted, not listed"
-	if !strings.Contains(n.Preview, "Settled: 1 accepted, 0 missing (not listed)") {
-		t.Errorf("the instance preview does not say what is not listed:\n%s", n.Preview)
-	}
-	for _, kid := range instanceNode(active, nil, false).Children {
-		if !strings.Contains(kid.Preview, itemLine) {
-			t.Errorf("item %s: no note that settled deliveries are not listed:\n%s", kid.Label, kid.Preview)
+// Every delivery state has its own word and glyph in the preview, one cell
+// wide, and none is the badge separator.
+func TestEveryDeliveryStateHasItsOwnWordAndGlyph(t *testing.T) {
+	states := []groundhog.DeliveryState{groundhog.DeliveryDelivered, groundhog.DeliveryPending, groundhog.DeliveryRunning,
+		groundhog.DeliveryInterrupted, groundhog.DeliveryAccepted, groundhog.DeliveryFailed, groundhog.DeliveryUnrecorded}
+	seen := map[string]groundhog.DeliveryState{}
+	for _, s := range states {
+		g := deliveryGlyph(s)
+		if other, dup := seen[g]; dup || g == "·" || lipgloss.Width(g) != 1 {
+			t.Errorf("%s: glyph %q (shared with %q, or not one cell)", s, g, other)
+		}
+		seen[g] = s
+		if line := deliveryLine(groundhog.Delivery{Path: "out/x", State: s}); line != "out/x: "+g+" "+string(s) {
+			t.Errorf("%s: line %q", s, line)
 		}
 	}
-	if strings.Contains(full.Preview, "Settled:") {
-		t.Errorf("a full read has no settled line:\n%s", full.Preview)
-	}
-	for _, kid := range full.Children {
-		if strings.Contains(kid.Preview, itemLine) {
-			t.Errorf("a full read's item %s carries the settled note", kid.Label)
-		}
-	}
-	none := inspected()
-	l0 := *none.Inspection.Last
-	l0.Status.Settled = &groundhog.Settled{}
-	none.Inspection.Last = &l0
-	if z := instanceNode(none, nil, false); strings.Contains(z.Preview, "Settled:") {
-		t.Errorf("a zero settled count should say nothing:\n%s", z.Preview)
-	}
-
-	// Settled deliveries alone, nothing listed: "none" must not be shown.
-	only := inspected()
-	l2 := *only.Inspection.Last
-	l2.Status.Deliveries = nil
-	l2.Status.Settled = &groundhog.Settled{Accepted: 4501, Missing: 2}
-	only.Inspection.Last = &l2
-	m := instanceNode(only, nil, false)
-	if !strings.Contains(m.Preview, "Deliveries: 2 missing, 4501 accepted") || strings.Contains(m.Preview, "Deliveries: none") {
-		t.Errorf("preview:\n%s", m.Preview)
-	}
-	if strings.Contains(m.Badge, "failed") {
-		t.Errorf("badge %q: settled missing deliveries are not failed ones", m.Badge)
+	if g := deliveryGlyph("teleported"); seen[g] != "" {
+		t.Errorf("an unknown state borrows %s's glyph", seen[g])
 	}
 }
 
-// An --active read counts a settled `missing` delivery and lists none, so no
-// item row could turn failed for it while the instance badge counted it as
-// failed. A missing delivery is settled for good: no action offers anything for
-// it (Retry failed and Recover take failed and uncertain ones). The tree
-// therefore calls only failed and uncertain deliveries failed, in the row and in
-// the badge alike, and a full read and an --active read of the same instance
-// show the same thing. The preview still counts it as missing.
-func TestAMissingDeliveryReadsTheSameInTheRowAndTheBadgeWhicheverReadShowedIt(t *testing.T) {
-	const beat = "beat"
-	build := func(active bool) core.InstanceView {
-		v := inspected()
-		last := *v.Inspection.Last
-		last.Status.Deliveries = []groundhog.Delivery{
-			{Path: "out/beat-gone", SchedulePath: sp("schedule/every/15m/beat"), State: groundhog.DeliveryMissing},
-			{Path: "out/waiting", State: groundhog.DeliveryPending},
-		}
-		if active {
-			last.Status.Deliveries = last.Status.Deliveries[1:]
-			last.Status.Settled = &groundhog.Settled{Missing: 1}
-		}
-		v.Inspection.Last = &last
-		return v
-	}
-	var badges []string
-	for _, active := range []bool{false, true} {
-		name := map[bool]string{false: "full read", true: "--active read"}[active]
-		n := instanceNode(build(active), nil, false)
-		var row *Node
-		for i := range n.Children {
-			if n.Children[i].Label == beat {
-				row = &n.Children[i]
-			}
-		}
-		if row == nil {
-			t.Fatalf("%s: no row %q", name, beat)
-		}
-		if row.State == StateFailed {
-			t.Errorf("%s: the row turned failed for a missing delivery", name)
-		}
-		if strings.Contains(n.Badge, "failed") {
-			t.Errorf("%s: the badge %q counts a missing delivery as failed", name, n.Badge)
-		}
-		if !strings.Contains(n.Preview, "1 missing") {
-			t.Errorf("%s: the preview does not count the missing delivery:\n%s", name, n.Preview)
-		}
-		badges = append(badges, n.Badge)
-	}
-	if badges[0] != badges[1] {
-		t.Errorf("the two reads of one instance badge differently: %q and %q", badges[0], badges[1])
-	}
-
-	// A failed and an uncertain delivery still turn the row and the badge, in both reads.
+// A running delivery makes its item's row read running, an interrupted one
+// failed, and the badge counts them.
+func TestRunningAndInterruptedDeliveriesReachTheRowsAndTheBadge(t *testing.T) {
 	v := inspected()
-	last := *v.Inspection.Last
-	last.Status.Deliveries = []groundhog.Delivery{
-		{Path: "out/a", SchedulePath: sp("schedule/every/15m/beat"), State: groundhog.DeliveryUncertain},
-		{Path: "out/b", State: groundhog.DeliveryFailed},
+	st := &v.Inspection.Last.Status
+	st.Deliveries = []groundhog.Delivery{
+		{Path: "out/beat-1", SchedulePath: sp("schedule/every/15m/beat"), State: groundhog.DeliveryRunning},
+		{Path: "out/review-1", SchedulePath: sp("schedule/weekly.paused/mon/review"), State: groundhog.DeliveryInterrupted},
 	}
-	last.Status.Settled = &groundhog.Settled{Missing: 3}
-	v.Inspection.Last = &last
 	n := instanceNode(v, nil, false)
-	if !strings.Contains(n.Badge, "2 failed") {
-		t.Errorf("badge %q: want 2 failed (failed and uncertain, not the 3 missing)", n.Badge)
+	if n.Badge != "3 items · 1 running · 1 failed" || n.State != StateFailed {
+		t.Errorf("badge %q state %v", n.Badge, n.State)
 	}
-	for _, kid := range n.Children {
-		if kid.Label == beat && kid.State != StateFailed {
-			t.Errorf("the row of an item with an uncertain delivery is %v", kid.State)
-		}
+	if beat := n.Children[2]; beat.State != StateRunning {
+		t.Errorf("beat %v", beat.State)
+	}
+	if review := n.Children[1]; review.State != StateFailed {
+		t.Errorf("review %v", review.State)
+	}
+}
+
+// The item's payload reference carries its deliveries' logs, newest first.
+func TestAnItemsPayloadCarriesItsRunLogsNewestFirst(t *testing.T) {
+	v := inspected()
+	st := &v.Inspection.Last.Status
+	older, newer := at.Add(-2*time.Hour), at.Add(-time.Hour)
+	st.Deliveries = append(st.Deliveries,
+		groundhog.Delivery{Path: "out/report-new", SchedulePath: sp("schedule/daily/09/report"), State: groundhog.DeliveryAccepted, FiredAt: &newer, Log: sp("out/report-new/.groundhog-log")},
+		groundhog.Delivery{Path: "out/report-old", SchedulePath: sp("schedule/daily/09/report"), State: groundhog.DeliveryAccepted, FiredAt: &older, Log: sp("out/report-old/.groundhog-log")})
+	ref := instanceNode(v, nil, false).Children[0].Payload
+	if want := []string{"out/report-2026-11-15/.groundhog-log", "out/report-new/.groundhog-log", "out/report-old/.groundhog-log"}; !slices.Equal(ref.Logs, want) {
+		t.Errorf("logs %q, want %q", ref.Logs, want)
 	}
 }
 
@@ -198,7 +128,7 @@ func TestItemsShowCadenceDueStateAndInheritedPause(t *testing.T) {
 	if report.State != StateFailed || report.Label != "report" || report.Badge != "daily at 09:00 · due now" {
 		t.Errorf("report: %+v", report)
 	}
-	for _, want := range []string{"Cadence: daily at 09:00", "Due: due now", "Delivery: out/report-2026-11-15: failed"} {
+	for _, want := range []string{"Cadence: daily at 09:00", "Due: due now", "Delivery: out/report-2026-11-15: ✗ failed"} {
 		if !strings.Contains(report.Preview, want) {
 			t.Errorf("report lacks %q:\n%s", want, report.Preview)
 		}
@@ -212,7 +142,7 @@ func TestItemsShowCadenceDueStateAndInheritedPause(t *testing.T) {
 			t.Errorf("review lacks %q:\n%s", want, review.Preview)
 		}
 	}
-	if !strings.Contains(beat.Preview, "Cadence: every 15m") || !strings.Contains(beat.Preview, "an owner is recorded; mystery") {
+	if !strings.Contains(beat.Preview, "Cadence: every 15m") || !strings.Contains(beat.Preview, "the instance is paused; mystery") {
 		t.Errorf("beat:\n%s", beat.Preview)
 	}
 	own := inspected()
@@ -224,7 +154,7 @@ func TestItemsShowCadenceDueStateAndInheritedPause(t *testing.T) {
 	pausedInst.Inspection.Last.Status.Paused = true
 	pn := instanceNode(pausedInst, nil, false)
 	if !strings.Contains(pn.Preview, "Pause: the instance is paused") || !strings.Contains(pn.Children[2].Preview, "Pause: inherited from the instance") ||
-		!strings.Contains(pn.Badge, "paused") {
+		strings.Contains(pn.Badge, "paused") { // the state word says paused; the badge leaves the verdict out
 		t.Errorf("instance pause:\n%s\n%s", pn.Preview, pn.Children[2].Preview)
 	}
 }
@@ -234,7 +164,7 @@ func TestAnUninspectedInstanceShowsOnlyWhatTheListingKnows(t *testing.T) {
 	v.Files = discovery.Glance{Schedule: []discovery.ScheduleDir{{Path: "weekly.paused", Paused: true}, {Path: "weekly.paused/review", Leaf: true, Paused: true}},
 		Out: []string{"a", "b"}, Runtime: true}
 	n := instanceNode(v, nil, false)
-	for _, banned := range []string{"Ownership", "Pause:", "Runner", "Consumer", "Deliveries", "Revision", "Last inspected"} {
+	for _, banned := range []string{"Pause:", "Deliveries", "Last inspected"} {
 		if strings.Contains(n.Preview, banned) {
 			t.Errorf("an uninspected instance shows %q:\n%s", banned, n.Preview)
 		}
@@ -253,22 +183,18 @@ func TestAnUninspectedInstanceShowsOnlyWhatTheListingKnows(t *testing.T) {
 	}
 }
 
-func TestLegacyFailingInconsistentAndStaleKeepTheirWordsInThePreview(t *testing.T) {
+func TestLegacyFailingAndStaleKeepTheirWordsInThePreview(t *testing.T) {
 	good := obs(okStatus())
-	bad := okStatus()
-	bad.Consistent = false
 	cases := map[string]struct {
 		v    core.InstanceView
 		want []string
 	}{
-		"failing": {iv("f", core.ClassUnowned, core.HealthOK, core.Inspection{Last: good, Err: errors.New("deadline exceeded"), ErrAt: at}),
+		"failing": {iv("f", core.ClassSupported, core.HealthOK, core.Inspection{Last: good, Err: errors.New("deadline exceeded"), ErrAt: at}),
 			[]string{"Error at 09:30:15: deadline exceeded", "(the last status that could be read)"}},
-		"stale": {iv("s", core.ClassUnowned, core.HealthStale, core.Inspection{Last: good}),
+		"stale": {iv("s", core.ClassSupported, core.HealthStale, core.Inspection{Last: good}),
 			[]string{"Health: stale", "stale: not re-read although it should have been"}},
-		"inconsistent": {iv("i", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(bad), Attempts: 3}),
-			[]string{"inconsistent status after 3 reads", "should not be acted on"}},
-		"legacy": {iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{Support: &groundhog.Support{Reason: "no capabilities"}}),
-			[]string{"Kind: legacy", "Support: unsupported, read-only: no capabilities"}},
+		"legacy": {iv("l", core.ClassLegacy, core.HealthOK, core.Inspection{Support: &groundhog.Support{Reason: "the script is an older Groundhog (runtime protocol 1)"}}),
+			[]string{"Kind: legacy", "Support: unsupported, read-only: the script is an older Groundhog"}},
 	}
 	for name, c := range cases {
 		got := instanceNode(c.v, nil, false).Preview
@@ -282,8 +208,8 @@ func TestLegacyFailingInconsistentAndStaleKeepTheirWordsInThePreview(t *testing.
 
 func TestHostileStatusTextStaysInertInThePreview(t *testing.T) {
 	v := inspected()
-	v.Inspection.Last.Status.Owner.Label = "evil\x1b[2J\x07label"
-	v.Inspection.Last.Status.Deliveries[0].Reason = sp("\x1b]0;pwned\x07boom")
+	v.Inspection.Last.Status.Deliveries[0].Path = "out/\x1b]0;pwned\x07boom"
+	v.Inspection.Last.Status.Diagnostics = []groundhog.Problem{{Code: "x", Message: "evil\x1b[2J\x07text"}}
 	m := NewWithData(FromView(core.View{Instances: []core.InstanceView{v}}))
 	next, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
 	out := next.(Model).View()

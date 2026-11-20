@@ -91,7 +91,13 @@ func Preview(fsys Files, inst, rel string) string {
 			fmt.Fprintf(&b, "%s(cannot list: %s)\n", prefix, reason(err))
 			return
 		}
-		sort.Slice(list, func(i, j int) bool { return list[i].Name() < list[j].Name() })
+		sort.Slice(list, func(i, j int) bool {
+			// An item's own run comes first: it says what firing the item does.
+			if a, b := depth == 0 && list[i].Name() == "run", depth == 0 && list[j].Name() == "run"; a != b {
+				return a
+			}
+			return list[i].Name() < list[j].Name()
+		})
 		for _, e := range list {
 			entries++
 			if entries > MaxEntries {
@@ -111,12 +117,25 @@ func Preview(fsys Files, inst, rel string) string {
 				}
 				fmt.Fprintf(&b, "%s/\n", name)
 				walk(full, name+"/", depth+1)
+			case depth == 0 && name == "run" && info.Mode()&fs.ModeSymlink != 0:
+				// Groundhog follows it: the delivery's copy keeps the link, and the
+				// wrapper starts what it points to. Easyhog never follows a link.
+				b.WriteString("run: a link named run. Groundhog starts what it points to when the item fires, if that is an executable file; the link is not followed here\n")
 			case !info.Mode().IsRegular():
 				fmt.Fprintf(&b, "%s: not a regular file (%s), not read\n", name, kind(info.Mode()))
 			case shown >= MaxFiles || total >= MaxTotalBytes:
 				skipped++
 			default:
 				shown++
+				if depth == 0 && name == "run" {
+					// Groundhog reserves the name: an executable run starts for each
+					// delivery of the item. Its text is shown like any file's.
+					if info.Mode().Perm()&0o111 != 0 {
+						b.WriteString("Runs when the item fires (Groundhog starts this executable for each delivery):\n")
+					} else {
+						b.WriteString("A file named run that is not executable, so it does not run:\n")
+					}
+				}
 				total += describeFile(&b, fsys, name, full, info.Size())
 			}
 		}
@@ -129,6 +148,45 @@ func Preview(fsys Files, inst, rel string) string {
 		fmt.Fprintf(&b, "… %d more not shown\n", skipped)
 	}
 	return b.String()
+}
+
+// MaxLogs is how many delivery logs one item's preview shows.
+const MaxLogs = 2
+
+// Log describes a delivery's run log at rel (slash-separated, relative to the
+// instance directory inst, "out/<name>/.groundhog-log", as status names it) as
+// bounded text, the way Preview shows a file: the start of it, cleaned by the
+// caller. A missing or unreadable log, or one reached through a symlink, is
+// described as such.
+func Log(fsys Files, inst, rel string) string {
+	dir, why := resolve(fsys, inst, filepath.ToSlash(filepath.Dir(filepath.FromSlash(rel))))
+	if why != "" || !strings.HasPrefix(rel, "out/") || filepath.Base(rel) != ".groundhog-log" {
+		return rel + ": not read (not a delivery log inside the instance)\n"
+	}
+	full := filepath.Join(dir, ".groundhog-log")
+	info, err := fsys.Lstat(full)
+	switch {
+	case err != nil:
+		return rel + ": cannot be read (" + reason(err) + ")\n"
+	case !info.Mode().IsRegular():
+		return rel + ": not a regular file, not read\n"
+	}
+	var b strings.Builder
+	describeFile(&b, fsys, rel, full, info.Size())
+	return b.String()
+}
+
+// ItemPreview is Preview for the item at rel, followed by the logs of its
+// newest deliveries (at most MaxLogs, as status names them).
+func ItemPreview(fsys Files, inst, rel string, logs []string) string {
+	text := Preview(fsys, inst, rel)
+	for i, l := range logs {
+		if i == MaxLogs {
+			break
+		}
+		text += "\nOutput of a run (read as text):\n" + Log(fsys, inst, l)
+	}
+	return text
 }
 
 // resolve checks that rel names a real directory beneath inst without passing

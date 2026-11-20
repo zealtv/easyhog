@@ -21,8 +21,8 @@ import (
 // with read-only commands only (`capabilities --json` and `status --json`).
 // It never runs `tick`, `run` or any control command.
 const (
-	pinnedScript = "../groundhog/testdata/upstream-1c68c9d/groundhog.sh"
-	pinnedSHA256 = "298c9d5d11465607796043d44c5e8dc42a20912aa52c00988505aaf8be09dbb9"
+	pinnedScript = "../groundhog/testdata/upstream-9317d4e/groundhog.sh"
+	pinnedSHA256 = "5a961d101ffc6d9186b836bd1f140c4c78e0b92770d682858a5a799d0cc562c2"
 )
 
 func listTree(t *testing.T, dir string) string {
@@ -105,7 +105,7 @@ func TestRefresherAgainstThePinnedScript(t *testing.T) {
 	if len(iv.Inspection.Last.Status.Schedule) != 1 || iv.Inspection.Last.Status.Schedule[0].Path != "schedule/daily/standup" {
 		t.Fatalf("schedule %+v", iv.Inspection.Last.Status.Schedule)
 	}
-	if iv.Health != HealthOK || (iv.Class != ClassUnowned && iv.Class != ClassUnsupported) {
+	if iv.Health != HealthOK || (iv.Class != ClassSupported && iv.Class != ClassUnsupported) {
 		t.Errorf("class %v health %v", iv.Class, iv.Health)
 	}
 	never(t, "the other instance was read without being selected", func() bool {

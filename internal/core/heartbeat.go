@@ -2,12 +2,6 @@ package core
 
 import "time"
 
-// DefaultTickInterval is the gap between ticks Easyhog expects when nothing says
-// otherwise: the pinned script's own default for `run`, and what it assumes for
-// anything outside Easyhog that ticks an instance, since Groundhog reports no
-// interval for those.
-const DefaultTickInterval = 60 * time.Second
-
 // Heartbeat is how recent an instance's last tick looks next to the gap its
 // ticker is expected to keep. It
 // is read from the status's own tick age, never from the clock of this machine.

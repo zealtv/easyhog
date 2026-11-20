@@ -37,17 +37,11 @@ func TestClassifyPreviewLine(t *testing.T) {
 
 		{"Kind", "Kind: owned_by_session · Health: ok", false, lineField, 6},
 		{"Palette offers", "Palette offers: Run, Open folder", false, lineField, 16},
-		{"This session's runner", "This session's runner: started", false, lineField, 23},
 		{"Support", "Support: protocol 1", false, lineField, 9},
 		{"Error at", "Error at 09:30:15: exit 3", false, lineField, 19},
-		{"Ownership", "Ownership: this session (alpha)", false, lineField, 11},
 		{"Pause", "Pause: not paused", false, lineField, 7},
-		{"Runner", "Runner: running", false, lineField, 8},
-		{"Runner's last error", "Runner's last error: exit: boom", false, lineField, 21},
-		{"Consumer", "Consumer: configured", false, lineField, 10},
 		{"Schedule", "Schedule: 3 items (1 due now, 0 already fired, 1 paused)", false, lineField, 10},
 		{"Deliveries", "Deliveries: 1 pending, 1 failed", false, lineField, 12},
-		{"Settled", "Settled: 4 accepted, 0 missing (not listed)", false, lineField, 9},
 		{"Diagnostic", "Diagnostic: code: message", false, lineField, 12},
 		{"Last inspected", "Last inspected: 09:30:15", false, lineField, 16},
 		{"directory listings", "From directory listings (nothing run): 3 schedule items, 2 entries in out/", false, lineField, 39},
@@ -59,9 +53,9 @@ func TestClassifyPreviewLine(t *testing.T) {
 		{"Due", "Due: due now", false, lineField, 5},
 		{"Firing held", "Firing held: not due", false, lineField, 13},
 		{"Delivery", "Delivery: out/x: failed (reason)", false, lineField, 10},
-		{"not offered", "Run and Stop are not offered: the script lacks the runtime commands (read-only).", false, lineField, 30},
+		{"not offered", "Nothing is offered: the script lacks what ticking, Retry and the pause need (read-only).", false, lineField, 20},
 
-		{"a listed delivery", "  out/report-2026-11-15: failed (consumer exited); attempt 1 of 1 failed", false, lineDelivery, 25},
+		{"a listed delivery", "  out/report-2026-11-15: ✗ failed; attempt 1 by tick, exit status 3", false, lineDelivery, 25},
 		{"more not listed", "  … more not listed", false, lineMore, 0},
 
 		{"an unknown label", "Mystery: something", false, lineOther, 0},
@@ -104,8 +98,8 @@ func TestTheAdaptersPreviewsUseKnownShapes(t *testing.T) {
 	if k, _ := classifyPreviewLine(lines[0], true); k != lineTitle {
 		t.Errorf("first line %q is not a title", lines[0])
 	}
-	want := map[string]previewKind{"Kind: ": lineField, "Ownership: ": lineField, "Pause: ": lineField, "Runner: ": lineField,
-		"Consumer: ": lineField, "Schedule: ": lineField, "Deliveries: ": lineField, "Last inspected: ": lineField,
+	want := map[string]previewKind{"Kind: ": lineField, "Pause: ": lineField,
+		"Schedule: ": lineField, "Deliveries: ": lineField, "Last inspected: ": lineField,
 		"  out/report-2026-11-15": lineDelivery, "  out/waiting": lineDelivery}
 	for prefix, kind := range want {
 		found := false
@@ -137,14 +131,14 @@ func TestTheAdaptersPreviewsUseKnownShapes(t *testing.T) {
 // field says states; the text is never altered.
 func TestValueSpansColourTimesAndStateWords(t *testing.T) {
 	st := newStyles()
-	spans := valueSpans("1 pending, 2 failed, 1 uncertain, 1 paused, at 09:30:15", true, st)
+	spans := valueSpans("1 pending, 2 failed, 1 interrupted, 1 paused, at 09:30:15", true, st)
 	byText := map[string]lipgloss.Style{}
 	var joined string
 	for _, s := range spans {
 		byText[s.text] = s.style
 		joined += s.text
 	}
-	if joined != "1 pending, 2 failed, 1 uncertain, 1 paused, at 09:30:15" {
+	if joined != "1 pending, 2 failed, 1 interrupted, 1 paused, at 09:30:15" {
 		t.Errorf("text changed: %q", joined)
 	}
 	for word, state := range map[string]State{"pending": StatePending, "failed": StateFailed, "paused": StatePaused} {
@@ -152,8 +146,8 @@ func TestValueSpansColourTimesAndStateWords(t *testing.T) {
 			t.Errorf("%q is not in the %s colour", word, state.label())
 		}
 	}
-	if byText["uncertain"].GetForeground() != st.warn.GetForeground() || byText["09:30:15"].GetForeground() != st.faint.GetForeground() {
-		t.Error("uncertain is not warn, or the time is not faint")
+	if byText["interrupted"].GetForeground() != st.warn.GetForeground() || byText["09:30:15"].GetForeground() != st.faint.GetForeground() {
+		t.Error("interrupted is not warn, or the time is not faint")
 	}
 	for _, s := range valueSpans("not paused at 09:30:15", false, st) {
 		if s.text == "paused" {
@@ -489,35 +483,33 @@ func TestStylingTakesTextAndOpensNothing(t *testing.T) {
 // a malformed and a legacy script, and a listing-only instance.
 func previewFixtures() []struct {
 	v    core.InstanceView
-	info *core.RunnerInfo
+	info *core.TickInfo
 } {
 	type fx = struct {
 		v    core.InstanceView
-		info *core.RunnerInfo
+		info *core.TickInfo
 	}
 	var out []fx
-	add := func(v core.InstanceView, info *core.RunnerInfo) { out = append(out, fx{v, info}) }
+	add := func(v core.InstanceView, info *core.TickInfo) { out = append(out, fx{v, info}) }
 
 	add(inspected(), nil)
-	add(ours("run", groundhog.RunnerRunning, false), nil)
-	add(withTick(ours("paused", groundhog.RunnerRunning, true), 12*time.Second, "runner"), nil)
-	add(withTick(unowned("other"), 45*time.Second, "standalone"), nil)
-	add(unowned("never"), nil)
+	add(supported("run"), here(0))
+	add(withTick(pausedInstance("paused"), 12*time.Second, "standalone"), here(0))
+	add(withTick(supported("other"), 45*time.Second, "standalone"), nil)
+	add(supported("never"), nil)
 
-	// Deliveries in every state, more than the preview lists, with settled counts.
-	many := ours("many", groundhog.RunnerRunning, false)
+	// Deliveries in every state, more than the preview lists.
+	many := supported("many")
 	var dels []groundhog.Delivery
 	for _, id := range []string{"d1", "d2", "d3", "d4", "d5", "d6", "d7"} {
-		dels = append(dels, delivery(id, groundhog.DeliveryFailed, "schedule/daily/a", "easyhog-1"))
+		dels = append(dels, delivery("out/"+id, groundhog.DeliveryFailed, "schedule/daily/a"))
 	}
-	dels = append(dels, delivery("u", groundhog.DeliveryUncertain, "schedule/daily/b", "easyhog-1"),
-		delivery("p", groundhog.DeliveryPending, "schedule/daily/b", ""), delivery("f", groundhog.DeliveryInFlight, "", ""))
+	dels = append(dels, delivery("out/i", groundhog.DeliveryInterrupted, "schedule/daily/b"),
+		delivery("out/p", groundhog.DeliveryPending, "schedule/daily/b"), delivery("out/r", groundhog.DeliveryRunning, ""))
 	many = withDeliveries(many, dels...)
 	st := many.Inspection.Last.Status
-	st.Settled = &groundhog.Settled{Accepted: 4, Missing: 1}
+	st.Schedule = []groundhog.ScheduleItem{{Path: "schedule/daily/a", ItemID: "a"}, {Path: "schedule/daily/b", ItemID: "b"}}
 	st.Diagnostics = []groundhog.Problem{{Code: "slow", Message: "tick took long"}}
-	st.Runner.LastError = &groundhog.Problem{Code: "exit", Message: "boom"}
-	st.Consumer = groundhog.Consumer{Configured: true}
 	st.Schedule[0].FiredMarker = sp("2026-11-15")
 	st.Schedule[0].NextDue = tp(at.Add(26 * time.Hour))
 	st.Schedule[1].PausedBy = []string{st.Schedule[1].Path}
@@ -525,16 +517,13 @@ func previewFixtures() []struct {
 	many.Inspection.Last = obs(st)
 	many.Files.Runtime, many.Files.OutTruncated = true, true
 	many.Files.Problems = []string{"schedule/x: unreadable"}
-	add(many, &core.RunnerInfo{Notice: "the runner ended on its own", Adopted: true, AdoptedFrom: at})
+	add(many, &core.TickInfo{Interval: time.Minute, LastBegan: at, LastEnded: at, LastErr: errors.New("tick: exit 1")})
 
-	for _, class := range []core.Class{core.ClassExternal, core.ClassUnsupported, core.ClassNotInspected, core.ClassLegacy, core.ClassFailing} {
+	for _, class := range []core.Class{core.ClassUnsupported, core.ClassNotInspected, core.ClassLegacy, core.ClassFailing} {
 		add(iv("c-"+class.String(), class, core.HealthOK, core.Inspection{Last: obs(okStatus())}), nil)
 	}
-	add(iv("stale", core.ClassUnowned, core.HealthStale, core.Inspection{Last: obs(okStatus())}), nil)
-	bad := okStatus()
-	bad.Consistent = false
-	add(iv("inconsistent", core.ClassUnowned, core.HealthInconsistent, core.Inspection{Last: obs(bad), Attempts: 3}), nil)
-	add(iv("failing", core.ClassUnowned, core.HealthOK, core.Inspection{Last: obs(okStatus()), Err: errors.New("deadline"), ErrAt: at}), nil)
+	add(iv("stale", core.ClassSupported, core.HealthStale, core.Inspection{Last: obs(okStatus())}), nil)
+	add(iv("failing", core.ClassSupported, core.HealthOK, core.Inspection{Last: obs(okStatus()), Err: errors.New("deadline"), ErrAt: at}), nil)
 	add(iv("neverread", core.ClassFailing, core.HealthOK, core.Inspection{Err: errors.New("exit 6"), ErrAt: at}), nil)
 	mal := iv("malformed", core.ClassMalformed, core.HealthOK, core.Inspection{})
 	mal.Instance.Malformed = []string{"groundhog.sh is missing"}

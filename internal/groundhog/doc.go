@@ -5,27 +5,23 @@
 // a substitute or upgraded script. The instance is the canonical `.groundhog`
 // directory that discovery reports, equal to `status.instance`.
 //
-// What it wraps, per the accepted runtime contract and the upstream readings
-// recorded for revision d5e3c1f:
+// What it wraps, per the runtime contract's protocol 2 (Groundhog 9317d4e):
 //
 //   - Capabilities and Negotiate: `capabilities --json` and the version and
-//     capability check. A script without the runtime commands (the legacy
-//     script) or with an unknown protocol version is reported as unsupported,
-//     read-only, with the reason. Control methods refuse it.
-//   - Status: `status --json` as a typed snapshot (Revision and the optional
-//     JournalGeneration are for display), strict about required fields.
-//   - Enroll, Pause, Resume, Stop, Release: the control commands Easyhog's
-//     Run and Stop need. The token travels only as `--token-file PATH`, and
-//     the client never reads that file.
+//     capability check. An older script (protocol 1, or one without the
+//     runtime commands) or an unknown protocol version is reported as
+//     unsupported, read-only, with the reason. The commands below refuse it.
+//   - Status: `status --json` as a typed snapshot, strict about required fields.
+//   - Tick, Retry, Pause and Resume: what Easyhog's Run, Retry and the instance
+//     pause need. None takes a token.
 //
-// It deliberately has no `run`. Starting and supervising the runner belongs to
-// the supervisor, which must give `run` file output, not a pipe it may close.
+// It deliberately has no `run`: Easyhog ticks an instance itself, one bounded
+// `tick` at a time.
 //
 // Every call is bounded: wall time (WithTimeout), captured stdout
 // (WithMaxStdout) and kept stderr (WithMaxStderr). Failures are typed:
 // *ExitError (exit mapped to a Kind), *CallError (timeout, cancel, start
 // failure), *MalformedError, *ProtocolError, *OutputLimitError,
-// *InstanceMismatchError, *UnsupportedError and *UncertainEnrollError.
-// Discovery alone never grants control; nothing here branches on a consumer,
-// host or application identity.
+// *InstanceMismatchError and *UnsupportedError. Discovery alone never grants
+// control; nothing here branches on a host or application identity.
 package groundhog

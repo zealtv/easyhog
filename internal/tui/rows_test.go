@@ -14,10 +14,18 @@ import (
 
 // Tests for the wording and layout of rows.
 
-// ownedWithDeliveries is an instance this session owns, its runner running or paused,
-// holding deliveries in the given states.
-func ownedWithDeliveries(name string, paused bool, states ...groundhog.DeliveryState) core.InstanceView {
-	v := ours(name, groundhog.RunnerRunning, paused)
+// tickAll is the ticker's word that this session ticks every instance.
+func tickAll(string) (core.TickInfo, bool) {
+	return core.TickInfo{Ticking: true, Interval: core.DefaultTickInterval}, true
+}
+
+// tickedWithDeliveries is an instance, paused or not, holding deliveries in the
+// given states; the tests show it with tickAll, so it reads ticked here.
+func tickedWithDeliveries(name string, paused bool, states ...groundhog.DeliveryState) core.InstanceView {
+	v := supported(name)
+	if paused {
+		v = pausedInstance(name)
+	}
 	st := v.Inspection.Last.Status
 	for i, s := range states {
 		st.Deliveries = append(st.Deliveries, groundhog.Delivery{Path: "out/d" + string(rune('a'+i)), State: s})
@@ -26,10 +34,11 @@ func ownedWithDeliveries(name string, paused bool, states ...groundhog.DeliveryS
 	return v
 }
 
-// A schedule item with nothing waiting reads scheduled, in its own
-// glyph; pending is left to an item with a delivery waiting for hand-over.
+// A schedule item with nothing waiting reads scheduled, in its own glyph;
+// pending is left to an item with a run waiting to start, and running to one
+// whose run is going.
 func TestScheduledItemsReadScheduledAndPendingMeansADeliveryWaiting(t *testing.T) {
-	v := ours("a", groundhog.RunnerRunning, false)
+	v := supported("a")
 	st := v.Inspection.Last.Status
 	st.Schedule = []groundhog.ScheduleItem{
 		{Path: "schedule/daily/quiet", ItemID: "quiet"},
@@ -38,7 +47,7 @@ func TestScheduledItemsReadScheduledAndPendingMeansADeliveryWaiting(t *testing.T
 		{Path: "schedule/daily/broken", ItemID: "broken"},
 		{Path: "schedule/daily/held.paused/x", ItemID: "x", PausedBy: []string{"schedule/daily/held.paused"}},
 	}
-	for path, s := range map[string]groundhog.DeliveryState{"waiting": groundhog.DeliveryPending, "busy": groundhog.DeliveryInFlight,
+	for path, s := range map[string]groundhog.DeliveryState{"waiting": groundhog.DeliveryPending, "busy": groundhog.DeliveryRunning,
 		"broken": groundhog.DeliveryFailed} {
 		st.Deliveries = append(st.Deliveries, groundhog.Delivery{Path: "out/" + path, SchedulePath: sp("schedule/daily/" + path), State: s})
 	}
@@ -46,10 +55,10 @@ func TestScheduledItemsReadScheduledAndPendingMeansADeliveryWaiting(t *testing.T
 	v.Inspection.Last = obs(st)
 
 	got := map[string]State{}
-	for _, c := range FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil)).Nodes[0].Children {
+	for _, c := range FromViewWith(core.View{Instances: []core.InstanceView{v}}, tickAll).Nodes[0].Children {
 		got[c.Label] = c.State
 	}
-	want := map[string]State{"quiet": StateScheduled, "waiting": StatePending, "busy": StatePending, "broken": StateFailed, "x": StatePaused}
+	want := map[string]State{"quiet": StateScheduled, "waiting": StatePending, "busy": StateRunning, "broken": StateFailed, "x": StatePaused}
 	for label, state := range want {
 		if got[label] != state {
 			t.Errorf("item %s reads %q (%s), want %q (%s)", label, got[label].label(), got[label].glyph(), state.label(), state.glyph())
@@ -61,7 +70,7 @@ func TestScheduledItemsReadScheduledAndPendingMeansADeliveryWaiting(t *testing.T
 // colour off.
 func TestEveryStateHasItsOwnWordAndGlyph(t *testing.T) {
 	words, glyphs := map[string]State{}, map[string]State{}
-	for s := StateStopped; s <= StateInconsistent; s++ {
+	for s := StateStopped; s <= StateScheduled; s++ {
 		if other, dup := words[s.label()]; dup {
 			t.Errorf("states %d and %d both read %q", other, s, s.label())
 		}
@@ -81,11 +90,11 @@ func TestEveryStateHasItsOwnWordAndGlyph(t *testing.T) {
 // A scheduled item's row says scheduled, and the plain row reads the same with
 // colour off.
 func TestAScheduledItemsRowSaysScheduled(t *testing.T) {
-	v := ours("a", groundhog.RunnerRunning, false)
+	v := supported("a")
 	st := v.Inspection.Last.Status
 	st.Schedule = []groundhog.ScheduleItem{{Path: "schedule/daily/quiet", ItemID: "quiet", Cadence: &groundhog.Cadence{Axis: "daily"}}}
 	v.Inspection.Last = obs(st)
-	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil))), tea.WindowSizeMsg{Width: 80, Height: 24},
+	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks())), tea.WindowSizeMsg{Width: 80, Height: 24},
 		key(tea.KeyRight))
 	row := ansi.Strip(m.treeRow(1, 80))
 	if !strings.Contains(row, "◷ quiet") || !strings.HasSuffix(strings.TrimRight(row, " "), "scheduled") || strings.Contains(row, "pending") {
@@ -93,46 +102,38 @@ func TestAScheduledItemsRowSaysScheduled(t *testing.T) {
 	}
 }
 
-// A failed or uncertain delivery makes the instance row read failed, as
-// it makes an item's row; missing and accepted ones do not.
-func TestInstanceRowReadsFailedForAFailedOrUncertainDelivery(t *testing.T) {
+// A failed or interrupted delivery makes the instance row read failed, as it
+// makes an item's row; running, pending, unrecorded and accepted ones do not.
+func TestInstanceRowReadsFailedForAFailedOrInterruptedDelivery(t *testing.T) {
 	cases := []struct {
 		name   string
 		v      core.InstanceView
 		state  State
 		detail string
 	}{
-		{"running, failed", ownedWithDeliveries("a", false, groundhog.DeliveryFailed, groundhog.DeliveryAccepted), StateFailed, "1 delivery failed, running"},
-		{"paused, uncertain", ownedWithDeliveries("b", true, groundhog.DeliveryUncertain, groundhog.DeliveryFailed), StateFailed, "2 deliveries failed, paused"},
-		{"running, pending only", ownedWithDeliveries("c", false, groundhog.DeliveryPending, groundhog.DeliveryInFlight), StateRunning, "running"},
-		{"running, missing and accepted", ownedWithDeliveries("d", false, groundhog.DeliveryMissing, groundhog.DeliveryAccepted), StateRunning, "running"},
+		{"running, failed", tickedWithDeliveries("a", false, groundhog.DeliveryFailed, groundhog.DeliveryAccepted), StateFailed, "1 delivery failed, running"},
+		{"paused, interrupted", tickedWithDeliveries("b", true, groundhog.DeliveryInterrupted, groundhog.DeliveryFailed), StateFailed, "2 deliveries failed, nothing fires or starts"},
+		{"running, pending only", tickedWithDeliveries("c", false, groundhog.DeliveryPending, groundhog.DeliveryRunning), StateRunning, "inspected "},
+		{"running, unrecorded and accepted", tickedWithDeliveries("d", false, groundhog.DeliveryUnrecorded, groundhog.DeliveryAccepted), StateRunning, "inspected "},
 	}
 	for _, c := range cases {
-		n := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, lookup(nil)).Nodes[0]
+		n := FromViewWith(core.View{Instances: []core.InstanceView{c.v}}, tickAll).Nodes[0]
 		if n.State != c.state || !strings.HasPrefix(n.Detail, c.detail) {
 			t.Errorf("%s: state %q detail %q, want %q starting %q", c.name, n.State.label(), n.Detail, c.state.label(), c.detail)
 		}
 	}
-	// An unowned instance that holds an uncertain delivery (a Quit that gave up
-	// waiting leaves one) reads failed too; so does one whose failed delivery sits
-	// beside a runner that ended: both are already failed or become so.
-	un := unowned("u")
+	// An instance not ticked here reads failed for an interrupted delivery too.
+	un := supported("u")
 	st := un.Inspection.Last.Status
-	st.Deliveries = []groundhog.Delivery{{Path: "out/x", State: groundhog.DeliveryUncertain}}
+	st.Deliveries = []groundhog.Delivery{{Path: "out/x", State: groundhog.DeliveryInterrupted}}
 	un.Inspection.Last = obs(st)
-	if n := FromView(core.View{Instances: []core.InstanceView{un}}).Nodes[0]; n.State != StateFailed || !strings.Contains(n.Detail, "not enrolled") {
-		t.Errorf("unowned with an uncertain delivery: %q %q", n.State.label(), n.Detail)
+	if n := FromView(core.View{Instances: []core.InstanceView{un}}).Nodes[0]; n.State != StateFailed || !strings.Contains(n.Detail, "not ticked") {
+		t.Errorf("not ticked, with an interrupted delivery: %q %q", n.State.label(), n.Detail)
 	}
-	// An inconsistent read is not acted on, so it keeps its own word (not
-	// pending, which is left to a delivery waiting); an unsupported instance keeps its word.
-	inc := ownedWithDeliveries("i", false, groundhog.DeliveryFailed)
-	inc.Health = core.HealthInconsistent
-	if n := FromViewWith(core.View{Instances: []core.InstanceView{inc}}, lookup(nil)).Nodes[0]; n.State != StateInconsistent || n.State.label() != "inconsistent" {
-		t.Errorf("inconsistent read reads %q", n.State.label())
-	}
-	uns := ownedWithDeliveries("s", false, groundhog.DeliveryFailed)
+	// An unsupported instance keeps its word.
+	uns := tickedWithDeliveries("s", false, groundhog.DeliveryFailed)
 	uns.Class = core.ClassUnsupported
-	if n := FromViewWith(core.View{Instances: []core.InstanceView{uns}}, lookup(nil)).Nodes[0]; n.State != StateUnsupported {
+	if n := FromViewWith(core.View{Instances: []core.InstanceView{uns}}, tickAll).Nodes[0]; n.State != StateUnsupported {
 		t.Errorf("unsupported instance reads %q", n.State.label())
 	}
 }
@@ -140,8 +141,8 @@ func TestInstanceRowReadsFailedForAFailedOrUncertainDelivery(t *testing.T) {
 // The badge and the row use one rule (failedState): the count in the badge is
 // the count the row's detail gives.
 func TestInstanceRowAndBadgeCountTheSameDeliveries(t *testing.T) {
-	v := ownedWithDeliveries("a", false, groundhog.DeliveryFailed, groundhog.DeliveryUncertain, groundhog.DeliveryMissing, groundhog.DeliveryPending)
-	n := FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil)).Nodes[0]
+	v := tickedWithDeliveries("a", false, groundhog.DeliveryFailed, groundhog.DeliveryInterrupted, groundhog.DeliveryUnrecorded, groundhog.DeliveryPending)
+	n := FromViewWith(core.View{Instances: []core.InstanceView{v}}, tickAll).Nodes[0]
 	if !strings.Contains(n.Badge, "2 failed") || !strings.HasPrefix(n.Detail, "2 deliveries failed") {
 		t.Errorf("badge %q detail %q", n.Badge, n.Detail)
 	}
@@ -151,12 +152,12 @@ func TestInstanceRowAndBadgeCountTheSameDeliveries(t *testing.T) {
 // whose delivery failed, and drops it from running or paused.
 func TestHeaderCountsInstancesWithAFailedDelivery(t *testing.T) {
 	v := core.View{Root: "/r", Instances: []core.InstanceView{
-		ours("ok", groundhog.RunnerRunning, false),
-		ownedWithDeliveries("bad", false, groundhog.DeliveryFailed),
-		ownedWithDeliveries("held", true, groundhog.DeliveryUncertain),
-		ours("idle", groundhog.RunnerRunning, true),
+		supported("ok"),
+		tickedWithDeliveries("bad", false, groundhog.DeliveryFailed),
+		tickedWithDeliveries("held", true, groundhog.DeliveryInterrupted),
+		pausedInstance("idle"),
 	}}
-	m, _ := feed(NewWithData(FromViewWith(v, lookup(nil))), tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ := feed(NewWithData(FromViewWith(v, tickAll)), tea.WindowSizeMsg{Width: 120, Height: 30})
 	if h := ansi.Strip(m.header(120)); !strings.Contains(h, "4 instances · 1 running · 1 paused · 2 failed") {
 		t.Errorf("header %q", h)
 	}
@@ -185,21 +186,21 @@ func TestTreePaneGrowsPastSixtyColumnsWhenWide(t *testing.T) {
 // the badge loses its last parts, and the state word goes last; every row stays
 // within its width.
 func TestRowsKeepTheStateWordAndBadgeBeforeTheRestOfTheLabel(t *testing.T) {
-	v := ownedWithDeliveries("team/bravo/nightly-exports/regional", true, groundhog.DeliveryPending)
-	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil))), tea.WindowSizeMsg{Width: 200, Height: 30})
+	v := tickedWithDeliveries("team/bravo/nightly-exports/regional", true, groundhog.DeliveryPending)
+	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks())), tea.WindowSizeMsg{Width: 200, Height: 30})
 	row := func(w int) string { return ansi.Strip(m.treeRow(0, w)) }
 
 	for _, w := range []int{64, 80, 100} {
 		r := row(w)
-		if !strings.HasSuffix(strings.TrimRight(r, " "), "paused") || !strings.Contains(r, "paused: won't run") {
-			t.Errorf("width %d: row %q lost the state word or the verdict", w, r)
+		if !strings.HasSuffix(strings.TrimRight(r, " "), "paused") || !strings.Contains(r, "1 pending") || strings.Contains(r, "won't run") {
+			t.Errorf("width %d: row %q lost the state word or the count, or kept the verdict", w, r)
 		}
 		if lipgloss.Width(r) > w {
 			t.Errorf("width %d: row is %d cells", w, lipgloss.Width(r))
 		}
 	}
 	// The label is cut with an ellipsis, never touching the badge.
-	if r := row(64); !strings.Contains(r, "…  ") {
+	if r := row(48); !strings.Contains(r, "…  ") {
 		t.Errorf("a cut label should leave two spaces before the badge: %q", r)
 	}
 	// Room for everything: the label stays whole.
@@ -209,7 +210,7 @@ func TestRowsKeepTheStateWordAndBadgeBeforeTheRestOfTheLabel(t *testing.T) {
 	// Narrower still: the badge goes before the label drops below its minimum,
 	// and the state word is the last thing to go.
 	r := row(34)
-	if !strings.Contains(r, "paused") || strings.Contains(r, "won't") || !strings.Contains(r, "team/bravo/nightl") {
+	if !strings.Contains(r, "paused") || strings.Contains(r, "pending") || !strings.Contains(r, "team/bravo/nightl") {
 		t.Errorf("width 34: %q", r)
 	}
 	if r := row(24); strings.Contains(r, "paused ") || !strings.Contains(r, "team/bravo/") {
@@ -223,14 +224,14 @@ func TestRowsKeepTheStateWordAndBadgeBeforeTheRestOfTheLabel(t *testing.T) {
 }
 
 // At 160x45 the paused instance with a backlog, under a long path, shows its
-// state word and its verdict in the real frame; at 80x24 too.
+// state word and its counts in the real frame; at 80x24 too.
 func TestWideAndSmallFramesShowTheStateWordAndBadge(t *testing.T) {
 	v := core.View{Root: "/r", Instances: []core.InstanceView{
-		ownedWithDeliveries("team/bravo/nightly-exports/regional", true, groundhog.DeliveryPending, groundhog.DeliveryPending),
-		ownedWithDeliveries("charlie", false, groundhog.DeliveryFailed),
+		tickedWithDeliveries("team/bravo/nightly-exports/regional", true, groundhog.DeliveryPending, groundhog.DeliveryPending),
+		tickedWithDeliveries("charlie", false, groundhog.DeliveryFailed),
 	}}
 	for _, size := range [][2]int{{160, 45}, {80, 24}} {
-		m, _ := feed(NewWithData(FromViewWith(v, lookup(nil))), tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		m, _ := feed(NewWithData(FromViewWith(v, tickAll)), tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		var paused, failed string
 		for _, line := range strings.Split(ansi.Strip(m.View()), "\n") {
 			line, _, _ = strings.Cut(line, "│") // the tree pane only
@@ -241,11 +242,33 @@ func TestWideAndSmallFramesShowTheStateWordAndBadge(t *testing.T) {
 				failed = line
 			}
 		}
-		if !strings.Contains(paused, "paused: won't run") || !strings.HasSuffix(strings.TrimRight(paused, " "), "paused") {
+		if !strings.Contains(paused, "2 pending") || strings.Contains(paused, "won't run") || !strings.HasSuffix(strings.TrimRight(paused, " "), "paused") {
 			t.Errorf("%dx%d: paused row %q", size[0], size[1], paused)
 		}
 		if !strings.HasSuffix(strings.TrimRight(failed, " "), "failed") {
 			t.Errorf("%dx%d: failed row %q", size[0], size[1], failed)
 		}
+	}
+}
+
+// The state word already says "running", so a running runner's detail leaves
+// it out (Bob, 2026-11-19: the preview read "running · running, inspected"),
+// and no stray comma is left; a failed delivery moves the word into the detail.
+func TestRunningRowDetailDoesNotEchoTheStateWord(t *testing.T) {
+	run := tickedWithDeliveries("a", false)
+	n := FromViewWith(core.View{Instances: []core.InstanceView{run}}, tickAll).Nodes[0]
+	if n.State != StateRunning || n.Detail != "inspected 09:30:15" {
+		t.Errorf("running: state %q detail %q, want running and %q", n.State.label(), n.Detail, "inspected 09:30:15")
+	}
+	stale := tickedWithDeliveries("b", false)
+	stale.Health = core.HealthStale
+	n = FromViewWith(core.View{Instances: []core.InstanceView{stale}}, tickAll).Nodes[0]
+	if n.State != StateRunning || n.Detail != "stale, inspected 09:30:15" {
+		t.Errorf("running, stale: state %q detail %q", n.State.label(), n.Detail)
+	}
+	failed := tickedWithDeliveries("c", false, groundhog.DeliveryFailed)
+	n = FromViewWith(core.View{Instances: []core.InstanceView{failed}}, tickAll).Nodes[0]
+	if n.State != StateFailed || n.Detail != "1 delivery failed, running, inspected 09:30:15" {
+		t.Errorf("running, failed: state %q detail %q", n.State.label(), n.Detail)
 	}
 }

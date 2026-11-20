@@ -15,10 +15,6 @@ var (
 	ErrUnsupported = errors.New("groundhog: script does not support control")
 	// ErrMalformed marks output that could not be read as the documented JSON.
 	ErrMalformed = errors.New("groundhog: malformed output")
-	// ErrEnrollUncertain marks an enroll whose outcome cannot be known from the
-	// call alone: the token file may or may not exist, ownership may or may not
-	// have been committed.
-	ErrEnrollUncertain = errors.New("groundhog: enrollment outcome uncertain")
 	// ErrOutputLimit marks a command that wrote more than the allowed stdout.
 	ErrOutputLimit = errors.New("groundhog: output limit exceeded")
 	// ErrInstanceMismatch marks a status naming a different instance than the
@@ -26,79 +22,73 @@ var (
 	ErrInstanceMismatch = errors.New("groundhog: status names a different instance")
 )
 
-// Kind classifies a non-zero exit of a control command by the runtime
-// contract's exit-code table and the recorded implementation readings.
+// Kind classifies a non-zero exit by the runtime contract's exit-code table.
 type Kind int
 
 const (
-	// KindUnexpected is any exit outside the table: 1 (an unknown command, as
-	// the legacy script answers), a signal death, or 7 from a command other than
-	// enroll.
+	// KindUnexpected is any exit outside the table: 1 from a command other than
+	// `tick` (an older script's unknown command, say), a signal death, or a code
+	// the contract does not list.
 	KindUnexpected Kind = iota
-	// KindInvalid is exit 2: invalid arguments or configuration. For token
-	// commands the recorded reading adds a missing or malformed token file.
+	// KindInvalid is exit 2: invalid arguments, or for `retry` not a delivery of
+	// this instance.
 	KindInvalid
-	// KindOwnership is exit 3: an ownership conflict. The recorded reading adds
-	// a foreign or stale token, or a token against an unowned instance.
-	KindOwnership
-	// KindBusy is exit 4: a lock conflict. The recorded reading adds `release`
-	// against a live runner. Retryable.
+	// KindPaused is exit 3: refused by the instance pause.
+	KindPaused
+	// KindBusy is exit 4: a lock stayed busy (for `retry`, the run is going or
+	// being started). Try again later.
 	KindBusy
-	// KindState is exit 5: invalid or unsupported state. The recorded reading
-	// adds `release` with an unresolved delivery attempt, and state bound to a
-	// different instance.
-	KindState
-	// KindIO is exit 6: an I/O failure. For enroll it guarantees failure before
-	// any owner was committed.
+	// KindNothing is exit 5: nothing to do, or not possible on this host (for
+	// `retry`, a delivery with no record, no run, or no executable `run`).
+	KindNothing
+	// KindIO is exit 6: an I/O failure.
 	KindIO
-	// KindUncertain is exit 7 from enroll: the owner record may have been
-	// written.
-	KindUncertain
+	// KindFiringFailed is exit 1 from `tick`: an item could not be fired, after
+	// the rest of the tick ran. Every tick tries it again.
+	KindFiringFailed
 )
 
 func (k Kind) String() string {
 	switch k {
 	case KindInvalid:
-		return "invalid arguments or token file"
-	case KindOwnership:
-		return "ownership conflict or stale token"
+		return "invalid arguments"
+	case KindPaused:
+		return "the instance is paused"
 	case KindBusy:
 		return "busy"
-	case KindState:
-		return "invalid state or unresolved attempt"
+	case KindNothing:
+		return "nothing to do"
 	case KindIO:
 		return "I/O failure"
-	case KindUncertain:
-		return "outcome uncertain"
+	case KindFiringFailed:
+		return "a firing failed"
 	default:
 		return "unexpected exit"
 	}
 }
 
-// kindFor maps one command's exit status. Only enroll gives 7 a meaning.
+// kindFor maps one command's exit status. `tick` gives 1 its own meaning
+// (KindFiringFailed); 3 and 5 are not in its table.
 func kindFor(command string, code int) Kind {
-	switch code {
-	case 2:
+	switch {
+	case code == 1 && command == "tick":
+		return KindFiringFailed
+	case code == 2:
 		return KindInvalid
-	case 3:
-		return KindOwnership
-	case 4:
+	case code == 3 && command != "tick":
+		return KindPaused
+	case code == 4:
 		return KindBusy
-	case 5:
-		return KindState
-	case 6:
+	case code == 5 && command != "tick":
+		return KindNothing
+	case code == 6:
 		return KindIO
-	case 7:
-		if command == "enroll" {
-			return KindUncertain
-		}
 	}
 	return KindUnexpected
 }
 
 // ExitError reports a script that ran and exited non-zero. Code is -1 when a
-// signal ended it. Stderr holds what the script wrote, bounded; it never holds
-// a token, because the client never reads the token file.
+// signal ended it. Stderr holds what the script wrote, bounded.
 type ExitError struct {
 	Command         string
 	Code            int
@@ -139,25 +129,6 @@ func (e *CallError) Error() string {
 }
 
 func (e *CallError) Unwrap() error { return e.Err }
-
-// UncertainEnrollError reports an enroll whose result cannot be trusted: exit 7,
-// a timeout or cancellation, a signal death, or any exit the contract does not
-// list. The token file may or may not exist and may be usable. Retain it, start
-// nothing, and reconcile with Status against the token's nonsecret metadata
-// before choosing the next step.
-type UncertainEnrollError struct {
-	TokenFile string
-	// Cause is the *ExitError or *CallError behind the uncertainty.
-	Cause error
-}
-
-func (e *UncertainEnrollError) Error() string {
-	return fmt.Sprintf("groundhog enroll: outcome uncertain, keep the token file and reconcile: %v", e.Cause)
-}
-
-func (e *UncertainEnrollError) Unwrap() error { return e.Cause }
-
-func (e *UncertainEnrollError) Is(target error) bool { return target == ErrEnrollUncertain }
 
 // MalformedError reports output that is not the documented JSON object. It
 // lists every problem found, so a half-filled value is never returned.

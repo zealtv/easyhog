@@ -1,6 +1,6 @@
 package tui
 
-// Ported from EasyLoom (~/repos/easyloom/internal/tui/markdown_test.go): the
+// Ported from EasyLoom (its internal/tui/markdown_test.go): the
 // renderer's cases, with this package's styles in place of EasyLoom's.
 
 import (

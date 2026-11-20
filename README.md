@@ -3,28 +3,28 @@
 A terminal viewer and controller for [Groundhog](https://github.com/zealtv/groundhog),
 the file-based scheduler. Point Easyhog at a directory: it lists every Groundhog instance
 (`.groundhog/` folder) beneath it, shows their schedules, deliveries and payloads, and
-runs and stops their runners while it stays open.
+ticks the ones you run while it stays open.
 
 ```text
  Easyhog  5 instances · 1 running                                              "/work/projects"
-━━ Instances 5 ━━━━━━━━━━━━━━━━━━━━━━━┬── Preview 1–17 of 25 ───────────────────────────────────
-  ▸ ○ alpha           1 item  stopped │ ● ours/runner
-  ▸ ○ contested       1 item  stopped │ running · running, inspected 09:30:15
-❯ ▾ ● ours/runner   will run  running │
-      ◌ tick        every 5m  pending │ /work/projects/ours/runner/.groundhog
+━━ Instances 5 ━━━━━━━━━━━━━━━━━━━━━━━┬── Preview 1–17 of 27 ───────────────────────────────────
+  ▸ ○ alpha           1 item  stopped │ ● team/worker
+  ▸ ○ nolock          1 item  stopped │ running • · inspected 09:30:15
+❯ ▾ ● team/worker   1 item  running • │
+      ◌ tick        every 5m  pending │ /work/projects/team/worker/.groundhog
   ▸ ○ slow            1 item  stopped │
-  ▸ ◇ external       1 item  external │ Kind: owned by this session · Health: current
-                                      │ Palette offers: Stop
+  ▸ ◇ external     1 item  external • │ Kind: supported · Health: current
+                                      │ Palette offers: Stop, Pause instance
+                                      │ This session ticks it every 1m00s; its last tick began
+                                      │ at 09:30:03. Runs start in sessions of their own and
+                                      │ outlive Easyhog.
                                       │
-                                      │ Pending work: yes, this session's runner is running (no
-                                      │ tick recorded yet).
-                                      │ Ownership: this session (easyhog)
+                                      │ Pending work: yes, this session ticks it; last tick 12s
+                                      │ before the 09:30:15 read.
+                                      │ Heartbeat: fresh, judged against a tick expected every
+                                      │ 1m00s (the interval this session ticks it at): fresh up
+                                      │ to 1m30s, late up to 3m00s.
                                       │ Pause: not paused
-                                      │ Runner: running
-                                      │ Consumer: configured
-                                      │
-                                      │ Schedule: 1 item (0 due now, 0 already fired, 0 paused)
-                                      │ Deliveries: 1 pending
  nothing runs until you choose it · : opens commands
  : commands   ↑↓ select   tab focus   ←→ fold   ⇧↑↓ scroll   ctrl+c quit
 ```
@@ -45,7 +45,9 @@ the binary in `bin/easyhog`, and `make install`, which copies it into `~/.local/
 (`PREFIX` changes that).
 
 You also need [Groundhog](https://github.com/zealtv/groundhog) in the projects you want
-to see. Easyhog runs on macOS and Linux only.
+to see: a copy with runtime protocol 2 (Groundhog 9317d4e or later), in which an item can
+carry its own `run`. Easyhog shows an older copy read-only. Easyhog runs on macOS and Linux
+only.
 
 ## Use
 
@@ -57,12 +59,15 @@ easyhog -version
 ```
 
 Move with the arrow keys; `→` opens an instance to show its schedule items. `:` opens the
-command palette, which holds every action: Run, Stop, Pause item, Retry failed, Refresh,
-Quit and the rest. Type to narrow the list, `Enter` to run a command, `Esc` to close.
+command palette, which holds every action: Run, Stop, Pause instance, Pause item, Retry,
+Refresh, Quit and the rest. Type to narrow the list, `Enter` to run a command, `Esc` to close.
 `ctrl+c` also quits. A stray letter never runs, stops or quits anything.
 
-Easyhog is not a daemon. The runners you run live only while it stays open, and when you
-quit it winds them down. To keep schedules running, leave it open in a spare terminal.
+Run means this Easyhog ticks the instance, once a minute, while it stays open; Stop and
+Quit stop ticking. A tick fires what is due and starts each item's `run` in a session of its
+own, so runs carry on after Easyhog quits. Easyhog is not a daemon: to keep schedules
+firing, leave it open in a spare terminal, or tick from cron or `groundhog.sh run`, which
+Easyhog shows beside its own.
 
 ## Licence and contributing
 

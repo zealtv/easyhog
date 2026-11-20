@@ -15,32 +15,32 @@ import (
 
 // FromView adapts the refresher's view to the view model. The refresher decides
 // what is known and how fresh it is; this only chooses words and states, so the
-// terminal can tell not-inspected, read-only, externally owned, failing and
-// stale apart. The one action it offers is Open folder, which shows the
-// instance directory in the file manager and runs nothing inside it. Use
-// FromViewWith to offer Run and Stop.
+// terminal can tell not-inspected, read-only, ticked, failing and stale apart.
+// The one action it offers is Open folder, which shows the instance directory
+// in the file manager and runs nothing inside it. Use FromViewWith to offer the
+// actions that change an instance.
 func FromView(v core.View) Data { return FromViewWith(v, nil) }
 
-// RunnerLookup reports what the supervisor knows about an instance it enrolled
-// (core.Supervisor.Runner satisfies it).
-type RunnerLookup func(instanceKey string) (core.RunnerInfo, bool)
+// TickLookup reports what this session's ticker knows about an instance
+// (core.Ticker.Info satisfies it).
+type TickLookup func(instanceKey string) (core.TickInfo, bool)
 
-// FromViewWith is FromView with the supervisor's side of the story, which makes
-// Run and Stop appear where they can work: see controls. A nil lookup means
-// nothing is supervised and no instance offers either.
-func FromViewWith(v core.View, runners RunnerLookup) Data {
+// FromViewWith is FromView with the ticker's side of the story, which makes
+// Run, Stop, the pause and Retry appear where they can work: see controls. A
+// nil lookup means nothing here acts, and no instance offers them.
+func FromViewWith(v core.View, ticks TickLookup) Data {
 	d := Data{Root: v.Root, Note: "No Groundhog instances were found beneath the root. No scheduled work has started."}
 	if v.DiscoverErr != nil {
 		d.Err = "rescan failed, showing the last list: " + v.DiscoverErr.Error()
 	}
 	for _, iv := range v.Instances {
-		var info *core.RunnerInfo
-		if runners != nil {
-			if ri, ok := runners(iv.Instance.Path); ok {
-				info = &ri
+		var info *core.TickInfo
+		if ticks != nil {
+			if ti, ok := ticks(iv.Instance.Path); ok {
+				info = &ti
 			}
 		}
-		d.Nodes = append(d.Nodes, instanceNode(iv, info, runners != nil))
+		d.Nodes = append(d.Nodes, instanceNode(iv, info, ticks != nil))
 	}
 	for _, dg := range v.Diagnostics {
 		msg := ""
@@ -53,16 +53,15 @@ func FromViewWith(v core.View, runners RunnerLookup) Data {
 	return d
 }
 
-// controls says which of Run and Stop an instance offers, and when it offers
-// neither, why. The rule is core.Offers, which the supervisor also applies when
-// an action runs; this only adds the terminal's own case, that nothing is
-// supervised, and the sentence's opening words.
-func controls(iv core.InstanceView, info *core.RunnerInfo, supervised bool) (offer []Action, why string) {
-	const need = "Run and Stop are not offered: "
-	if !supervised {
-		return nil, need + "nothing here is supervised."
+// controls says what an instance offers, and when it offers nothing, why. The
+// rule is core.Offers; this only adds the terminal's own case, that nothing
+// here acts, and the sentence's opening words.
+func controls(iv core.InstanceView, tick *core.TickInfo, acting bool, item string) (offer []Action, why string) {
+	const need = "Nothing is offered: "
+	if !acting {
+		return nil, need + "this view acts on nothing."
 	}
-	actions, reason := core.Offers(iv, info)
+	actions, reason := core.OffersOn(iv, tick, item)
 	for _, a := range actions {
 		offer = append(offer, Action(a))
 	}
@@ -73,9 +72,7 @@ func controls(iv core.InstanceView, info *core.RunnerInfo, supervised bool) (off
 }
 
 // healthWord is the one word the preview gives for how far to trust what is
-// shown. Whether the newest read failed, or nothing was read, comes from the
-// instance (Inspection.Err, Inspection.Last); Health says only how far the
-// status that is shown can be trusted.
+// shown.
 func healthWord(iv core.InstanceView) string {
 	switch {
 	case iv.Inspection.Err != nil:
@@ -136,14 +133,15 @@ func instanceLabel(in discovery.Instance) string {
 	return strings.TrimSuffix(in.Display, "/.groundhog")
 }
 
-func instanceNode(iv core.InstanceView, info *core.RunnerInfo, supervised bool) Node {
+func instanceNode(iv core.InstanceView, tick *core.TickInfo, acting bool) Node {
 	in, files := iv.Inspection, iv.Files
-	offer, why := controls(iv, info, supervised)
+	offer, why := controls(iv, tick, acting, "")
 	n := Node{Key: iv.Instance.Path, Label: instanceLabel(iv.Instance), Actions: append(offer, ActionOpenFolder)}
-	if last := in.Last; last != nil {
-		n.ActionNotes = settleNotes(offer, last.Status, "")
-	}
 	last := in.Last
+	if last != nil {
+		n.ActionNotes = retryNotes(offer, last.Status, "")
+	}
+	ticking := tick != nil && tick.Ticking
 	// Hidden by class only, never by name: what the listing or the negotiated
 	// script showed is what the reader may not want to see by default.
 	n.Hidden = iv.Class == core.ClassMalformed || iv.Class == core.ClassLegacy || iv.Class == core.ClassUnsupported
@@ -156,76 +154,63 @@ func instanceNode(iv core.InstanceView, info *core.RunnerInfo, supervised bool) 
 		n.State, n.Detail = StateFailed, "failing, last good "+clock(last.TakenAt)
 	case in.Err != nil:
 		n.State, n.Detail = StateFailed, "inspection failed"
-	case iv.Health == core.HealthInconsistent:
-		n.State, n.Detail = StateInconsistent, "inconsistent read, as of "+clock(last.TakenAt)
-	case iv.Class == core.ClassExternal:
-		n.State, n.Detail = StateExternal, ownedByDetail(iv)
-	case tickedFromOutside(iv):
-		n.State, n.Detail = StateExternal, "ticked from outside Easyhog"
 	case iv.Class == core.ClassUnsupported:
 		n.State, n.Detail = StateUnsupported, "cannot be controlled, read-only"
-	case iv.Class == core.ClassNotInspected && info != nil && info.Adopted:
-		// Taken over from a session that ended; nothing says so until the reader
-		// selects it, yet Quit counts its runner.
-		n.State, n.Detail = StateStopped, "adopted, not inspected"
-	case iv.Class == core.ClassNotInspected:
+	case iv.Class == core.ClassNotInspected || last == nil:
 		n.State, n.Detail = StateStopped, "not inspected"
-	case last != nil && last.Status.Runner.State == "running" && iv.Class == core.ClassOwnedBySession && last.Status.Paused:
-		// The contract keeps the runner alive while paused, so status reads
-		// paused: true with runner.state: running. Only this session's runner is
-		// shown as paused; an external or unowned instance keeps the generic
-		// word for its class, and its badge and preview still say "paused".
-		n.State, n.Detail = StatePaused, "paused, runner idle"
-	case last != nil && last.Status.Runner.State == "running" && iv.Class == core.ClassOwnedBySession:
-		n.State, n.Detail = StateRunning, "running"
-	case last != nil && last.Status.Runner.State == "stopping" && iv.Class == core.ClassOwnedBySession:
-		n.State, n.Detail = StateStopped, "runner stopping"
-	case iv.Class == core.ClassOwnedBySession:
-		// This session holds the token and Quit will stop and release it, but no
-		// runner ticks it: stopped, failed or unknown.
-		n.State, n.Detail = StateStopped, "enrolled, no runner"
+	case last.Status.Paused:
+		// The pause holds every ticker back, so it outranks who ticks it.
+		n.State, n.Detail = StatePaused, "nothing fires or starts"
+		if ticking {
+			n.Detail += "; this session still ticks it"
+		}
+	case ticking:
+		// The state word already says "running"; the detail adds only a problem.
+		n.State = StateRunning
+		if tick.LastErr != nil {
+			n.Detail = "the last tick failed"
+		}
+	case core.TickedFromOutside(iv, tick): // a fresh tick that was not this session's
+		n.State, n.Detail = StateExternal, "ticked from outside Easyhog"
 	default:
-		n.State, n.Detail = StateStopped, "not enrolled"
-	}
-	if info != nil && info.Phase == core.PhaseExited && iv.Class == core.ClassOwnedBySession {
-		n.State, n.Detail = StateFailed, "runner ended on its own, not restarted"
+		n.State, n.Detail = StateStopped, "not ticked"
 	}
 	if iv.Health == core.HealthStale && in.Err == nil {
-		n.Detail += " (stale)"
+		n.Detail = joinDetail(n.Detail, "stale")
 	}
-	if last != nil && n.State != StateFailed && iv.Health != core.HealthInconsistent {
-		n.Detail += ", inspected " + clock(last.TakenAt)
+	if last != nil && n.State != StateFailed {
+		n.Detail = joinDetail(n.Detail, "inspected "+clock(last.TakenAt))
 	}
-	// A failed or uncertain delivery makes the instance row read failed, as it
-	// makes an item's row, whatever the runner is doing: the runner's own state
-	// stays in the badge's verdict, the detail and the preview. An unsupported
-	// instance keeps its word, and an inconsistent read is not acted on.
-	if last != nil && n.State != StateFailed && n.State != StateUnsupported && iv.Health != core.HealthInconsistent {
+	// A failed or interrupted delivery makes the instance row read failed, as it
+	// makes an item's row, whatever ticks it: who ticks it moves into the detail
+	// and stays in the preview. An unsupported instance keeps its word.
+	if last != nil && n.State != StateFailed && n.State != StateUnsupported {
 		if k := failedCount(last.Status); k > 0 {
-			n.State, n.Detail = StateFailed, plural(k, "delivery", "deliveries")+" failed, "+n.Detail
+			rest := n.Detail
+			if n.State == StateRunning {
+				rest = joinDetail("running", rest)
+			}
+			n.State, n.Detail = StateFailed, joinDetail(plural(k, "delivery", "deliveries")+" failed", rest)
 		}
 	}
 
-	beat := heartbeatOf(iv, n.State, info)
+	beat := heartbeatOf(iv, n.State, tick)
 	n.Heartbeat = beat.level
 
 	var p strings.Builder
 	fmt.Fprintf(&p, "%s\n\n", iv.Instance.Path)
 	fmt.Fprintf(&p, "Kind: %s · Health: %s\n", iv.Class, healthWord(iv))
-	if supervised {
+	if acting {
 		if len(offer) > 0 {
 			fmt.Fprintf(&p, "Palette offers: %s\n", actionNames(offer))
 		} else {
 			p.WriteString(why + "\n")
 		}
-		if note := settleExplanation(iv, offer); note != "" {
+		if note := retryExplanation(iv, offer, ""); note != "" {
 			p.WriteString(note + "\n")
 		}
-		if info != nil && info.Notice != "" {
-			fmt.Fprintf(&p, "This session's runner: %s\n", short(info.Notice, 300))
-		}
-		if info != nil && info.Adopted {
-			fmt.Fprintf(&p, "Adopted from a session that ended at %s. Its runner, if still running, is not this session's: Stop, Run and Quit work through the token.\n", clock(info.AdoptedFrom))
+		if line := tickLine(tick); line != "" {
+			p.WriteString(line + "\n")
 		}
 	}
 	switch {
@@ -239,7 +224,7 @@ func instanceNode(iv core.InstanceView, info *core.RunnerInfo, supervised bool) 
 	}
 	switch {
 	case last != nil:
-		statusPreview(&p, iv, beat)
+		statusPreview(&p, iv, tick, beat)
 	case iv.Class != core.ClassMalformed && iv.Class != core.ClassLegacy:
 		p.WriteString("Not inspected: nothing was run for this instance. Select it, or choose Refresh in the palette, to read its status.\n")
 	}
@@ -257,66 +242,72 @@ func instanceNode(iv core.InstanceView, info *core.RunnerInfo, supervised bool) 
 	n.Preview = p.String()
 
 	n.Badge = instanceBadge(iv)
-	if v, ok := core.PendingVerdict(iv); ok && tickedFromOutside(iv) && slices.Contains(offer, ActionRun) {
-		n.RunConfirm = fmt.Sprintf("Something outside Easyhog ticked %s %s before the last read. If Easyhog runs it, those ticks will fail until you Stop it here. Run anyway?",
-			short(n.Label, 40), ageText(v.Age))
-	}
-	if slices.Contains(offer, ActionRun) && settlesJournal(iv) {
-		n.RunNote = "will settle an interrupted journal write" // replaces the tick note: the read is not coherent
-	}
-	n.Children = scheduleNodes(iv, info, supervised)
+	n.Children = scheduleNodes(iv, tick, acting)
 	return n
 }
 
-// ownedByDetail is the detail line of an instance another supervisor owns: the
-// owner's own label when the status gives one, cut short and made safe to draw.
-func ownedByDetail(iv core.InstanceView) string {
-	if last := iv.Inspection.Last; last != nil && last.Status.Owner != nil {
-		if label := cleanLine(short(last.Status.Owner.Label, 40)); label != "" {
-			return "owned by " + label
+// tickLine is the preview's line on what this session's ticker does with the
+// instance, "" when it never ticked it.
+func tickLine(tick *core.TickInfo) string {
+	if tick == nil {
+		return ""
+	}
+	var b strings.Builder
+	if tick.Ticking {
+		fmt.Fprintf(&b, "This session ticks it every %s", ageText(tick.Interval))
+	} else {
+		b.WriteString("This session stopped ticking it")
+	}
+	if !tick.LastBegan.IsZero() {
+		fmt.Fprintf(&b, "; its last tick began at %s", clock(tick.LastBegan))
+		if tick.LastErr != nil {
+			b.WriteString(" and failed: " + short(tick.LastErr.Error(), 200))
 		}
 	}
-	return "owned by another supervisor"
+	b.WriteString(". Runs start in sessions of their own and outlive Easyhog.")
+	return b.String()
 }
 
-// tickedFromOutside reports the second kind of external instance: nobody owns it,
-// and the one verdict (core.PendingVerdict) says it probably keeps being ticked,
-// by a standalone `tick` that Easyhog did not make. It reads the verdict and adds
-// no freshness rule of its own. A recent tick whose source is "runner" is not this
-// kind: a runner that has just been stopped and released here, or by another
-// supervisor, leaves one behind for the same three minutes, and the reader who
-// pressed Stop would otherwise see the instance as someone else's.
-func tickedFromOutside(iv core.InstanceView) bool { return core.TickedFromOutside(iv) }
+// joinDetail joins two parts of a detail with ", ", leaving out an empty one so
+// no stray comma is left.
+func joinDetail(a, b string) string {
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	return a + ", " + b
+}
 
 // beatReading is the heartbeat level of a row something drives, and what it was
 // judged against.
 type beatReading struct {
 	level    core.Heartbeat
 	interval time.Duration
-	// own is true for this session's runner, whose interval Easyhog knows (the
-	// default when the lookup gave none); false for anything outside Easyhog,
-	// where 60 s is assumed.
+	// own is true for this session's ticking, whose interval Easyhog knows; false
+	// for anything outside Easyhog, where 60 s is assumed.
 	own bool
 }
 
 // heartbeatOf reads the heartbeat for an instance row, by the row's final state.
-// Only the rows something drives get one: external (both kinds) and running. A
-// stopped, paused, failed, unsupported or inconsistent row gets none, and neither
-// does a row with no recorded tick. This session's runner is judged against the
-// interval it keeps (info.Interval), anything else against core.DefaultTickInterval.
-func heartbeatOf(iv core.InstanceView, state State, info *core.RunnerInfo) beatReading {
+// Only the rows something drives get one: external and running. A stopped,
+// paused, failed or unsupported row gets none, and neither does a row with no
+// recorded tick. This session's ticking is judged against the interval it keeps
+// (tick.Interval), anything else against core.DefaultTickInterval.
+func heartbeatOf(iv core.InstanceView, state State, tick *core.TickInfo) beatReading {
 	if state != StateExternal && state != StateRunning {
 		return beatReading{}
 	}
-	v, ok := core.PendingVerdict(iv)
+	v, ok := core.PendingVerdict(iv, tick)
 	if !ok {
 		return beatReading{}
 	}
 	b := beatReading{interval: core.DefaultTickInterval}
 	if state == StateRunning {
 		b.own = true
-		if info != nil && info.Interval > 0 {
-			b.interval = info.Interval
+		if tick != nil && tick.Interval > 0 {
+			b.interval = tick.Interval
 		}
 	}
 	b.level = core.HeartbeatOf(v, b.interval)
@@ -330,91 +321,57 @@ func (b beatReading) preview() string {
 	late := max(core.TickFreshness, fresh)
 	who := "assumed for something outside Easyhog, since Groundhog reports no interval"
 	if b.own {
-		who = "this session's runner's interval"
+		who = "the interval this session ticks it at"
 	}
 	return fmt.Sprintf("Heartbeat: %s, judged against a tick expected every %s (%s): fresh up to %s, late up to %s.",
 		b.level, ageText(b.interval), who, ageText(fresh), ageText(late))
 }
 
-// settleNotes are the hints beside the settling actions in the palette: how many
-// deliveries each would act on (item is "" for the instance, else that item's path).
-func settleNotes(offer []Action, st groundhog.Status, item string) map[Action]string {
-	var out map[Action]string
-	for _, a := range offer {
-		if !a.settles() {
-			continue
-		}
-		n := len(core.SettleTargets(st, core.Action(a), item))
-		word := "failed"
-		if a != ActionRetryFailed {
-			word = "uncertain"
-		}
-		if out == nil {
-			out = map[Action]string{}
-		}
-		out[a] = fmt.Sprintf("%d %s", n, word)
+// retryNotes is the hint beside Retry in the palette: how many runs it would
+// start again (item is "" for the instance, else that item's path).
+func retryNotes(offer []Action, st groundhog.Status, item string) map[Action]string {
+	if !slices.Contains(offer, ActionRetry) {
+		return nil
 	}
-	return out
+	return map[Action]string{ActionRetry: fmt.Sprintf("%d to retry", len(core.RetryTargets(st, item)))}
 }
 
-// settleExplanation is the preview's account of the settling actions: what each
-// does when it is offered, and for an unowned instance that holds deliveries
-// waiting on a decision (a Quit that gave up waiting leaves such an instance
-// unowned), that Run comes first. Empty when neither applies.
-func settleExplanation(iv core.InstanceView, offer []Action) string {
+// retryExplanation is the preview's account of Retry: what it does where it is
+// offered, and why it is not where failed or interrupted runs wait behind the
+// pause. Empty when neither applies.
+func retryExplanation(iv core.InstanceView, offer []Action, item string) string {
 	last := iv.Inspection.Last
 	if last == nil {
 		return ""
 	}
-	counts := last.Status.DeliveryCounts()
-	failed, uncertain := counts[groundhog.DeliveryFailed], counts[groundhog.DeliveryUncertain]
-	var parts []string
-	if slices.Contains(offer, ActionRetryFailed) {
-		parts = append(parts, "Retry failed makes the failed deliveries pending, for a new attempt.")
-	}
-	if slices.Contains(offer, ActionRecoverAccept) {
-		parts = append(parts, "Recover as done records the uncertain ones as accepted on your say-so; Recover and retry makes them pending. Nothing is invoked, and Easyhog cannot know what the consumer did, so check first.")
-	}
-	if len(parts) > 0 {
-		return strings.Join(parts, " ") + " Each stops this session's runner for a moment and starts it again if it was running (the pause stays as it is)."
-	}
-	if iv.Class != core.ClassUnowned || !slices.Contains(offer, ActionRun) || failed+uncertain == 0 {
-		return ""
-	}
-	// Nothing to settle with yet: the instance is not this session's.
-	var what []string
-	if uncertain > 0 {
-		what = append(what, plural(uncertain, "uncertain delivery", "uncertain deliveries")+" (every handoff waits until they are recovered)")
-	}
-	if failed > 0 {
-		what = append(what, plural(failed, "failed delivery", "failed deliveries"))
-	}
-	text := "Holds " + strings.Join(what, " and ") + ". Settling needs this session's token: Run enrolls it for this session, and then "
+	targets := core.RetryTargets(last.Status, item)
 	switch {
-	case uncertain > 0 && failed > 0:
-		text += "Recover as done, Recover and retry and Retry failed are offered."
-	case uncertain > 0:
-		text += "Recover as done and Recover and retry are offered."
-	default:
-		text += "Retry failed is offered."
+	case slices.Contains(offer, ActionRetry):
+		text := "Retry starts the failed and interrupted runs again, as new attempts."
+		if hasInterrupted(last.Status, item) {
+			text += " An interrupted run lost its wrapper, not necessarily its process: check it has ended before retrying."
+		}
+		return text
+	case len(targets) > 0 && last.Status.Paused:
+		return "Retry waits for Unpause instance, since a paused instance starts nothing."
 	}
-	return text
+	return ""
 }
 
-// settlesJournal reports whether Run would settle an interrupted journal write
-// on this instance (core.SettlesOnRun).
-func settlesJournal(iv core.InstanceView) bool {
-	return iv.Class == core.ClassUnowned && iv.Health == core.HealthInconsistent &&
-		iv.Inspection.Last != nil && core.SettlesOnRun(iv.Inspection.Last.Status)
+func hasInterrupted(st groundhog.Status, item string) bool {
+	for _, d := range st.Deliveries {
+		if d.State == groundhog.DeliveryInterrupted && (item == "" || d.SchedulePath != nil && *d.SchedulePath == item) {
+			return true
+		}
+	}
+	return false
 }
 
 // failedState reports whether the tree calls a delivery in state s failed, in the
-// instance badge and in an item's row alike: the failed and uncertain ones, which
-// Retry failed and the Recovers act on. A `missing` delivery is settled for good
-// and offers nothing, and an --active read only counts it, so no item could show
-// it; it stays out of both, and the preview still counts it.
+// instance badge and in an item's row alike: the failed and interrupted ones,
+// which Retry acts on.
 func failedState(s groundhog.DeliveryState) bool {
-	return s == groundhog.DeliveryFailed || s == groundhog.DeliveryUncertain
+	return s == groundhog.DeliveryFailed || s == groundhog.DeliveryInterrupted
 }
 
 // failedCount is how many deliveries in st the tree calls failed (failedState).
@@ -428,54 +385,29 @@ func failedCount(st groundhog.Status) int {
 	return n
 }
 
-// settled reports an --active read that left settled deliveries out of the
-// list: accepted and missing ones are counted in Status.Settled instead.
-func settled(st groundhog.Status) bool {
-	return st.Settled != nil && st.Settled.Accepted+st.Settled.Missing > 0
-}
+// deliveryOrder is the order the preview counts delivery states in: what needs
+// attention first.
+var deliveryOrder = []groundhog.DeliveryState{groundhog.DeliveryFailed, groundhog.DeliveryInterrupted,
+	groundhog.DeliveryRunning, groundhog.DeliveryPending, groundhog.DeliveryAccepted, groundhog.DeliveryDelivered,
+	groundhog.DeliveryUnrecorded}
 
-// statusPreview writes what a script's status said: ownership, pause, runner,
-// consumer, schedule and delivery summaries. Everything here is "as of" the
-// time of the read, and the caller has already said how far to trust it.
-func statusPreview(p *strings.Builder, iv core.InstanceView, beat beatReading) {
-	in, last := iv.Inspection, iv.Inspection.Last
+// statusPreview writes what a script's status said: pause, ticks, schedule and
+// delivery summaries. Everything here is "as of" the time of the read, and the
+// caller has already said how far to trust it.
+func statusPreview(p *strings.Builder, iv core.InstanceView, tick *core.TickInfo, beat beatReading) {
+	last := iv.Inspection.Last
 	st := last.Status
-	if !st.Consistent && settlesJournal(iv) {
-		p.WriteString("The script reported an unfinished delivery journal write. Nothing else is wrong with the status; Run will settle it (enrolling takes the lock that does) and then read the status again.\n")
-	} else if !st.Consistent {
-		fmt.Fprintf(p, "The script reported an inconsistent status after %d reads; it is shown as seen and should not be acted on.\n", in.Attempts)
-	}
 	p.WriteString("\n")
-	if v, ok := core.PendingVerdict(iv); ok {
-		p.WriteString(verdictPreview(v) + "\n")
+	if v, ok := core.PendingVerdict(iv, tick); ok {
+		p.WriteString(verdictPreview(v, last.TakenAt.Location()) + "\n")
 	}
 	if beat.level != core.HeartbeatNone {
 		p.WriteString(beat.preview() + "\n")
 	}
-	switch {
-	case st.Owner == nil:
-		p.WriteString("Ownership: none recorded\n")
-	case iv.Class == core.ClassOwnedBySession:
-		fmt.Fprintf(p, "Ownership: this session (%s)\n", short(st.Owner.Label, 80))
-	default:
-		fmt.Fprintf(p, "Ownership: another supervisor, %s (%s). Easyhog only inspects it.\n", short(st.Owner.Label, 80), short(st.Owner.ID, 80))
-	}
 	if st.Paused {
-		p.WriteString("Pause: the instance is paused, so no item fires\n")
+		p.WriteString("Pause: the instance is paused, so no tick fires an item or starts a run, and Retry waits\n")
 	} else {
 		p.WriteString("Pause: not paused\n")
-	}
-	fmt.Fprintf(p, "Runner: %s\n", st.Runner.State)
-	if e := problemText(st.Runner.LastError); e != "" {
-		fmt.Fprintf(p, "Runner's last error: %s\n", e)
-	}
-	switch c := st.Consumer; {
-	case !c.Configured:
-		p.WriteString("Consumer: not configured\n")
-	case !c.Valid:
-		p.WriteString("Consumer: configured, but not valid\n")
-	default:
-		p.WriteString("Consumer: configured\n")
 	}
 
 	paused, due, fired := 0, 0, 0
@@ -495,25 +427,25 @@ func statusPreview(p *strings.Builder, iv core.InstanceView, beat beatReading) {
 	}
 	p.WriteString("\n")
 
-	counts := st.DeliveryCounts() // listed deliveries plus the settled ones an --active read only counts
-	total := 0
-	for _, n := range counts {
-		total += n
-	}
-	if total == 0 {
+	counts := st.DeliveryCounts()
+	if len(st.Deliveries) == 0 {
 		p.WriteString("Deliveries: none\n")
 	} else {
 		var parts []string
-		for _, s := range []groundhog.DeliveryState{groundhog.DeliveryPending, groundhog.DeliveryInFlight, groundhog.DeliveryFailed,
-			groundhog.DeliveryUncertain, groundhog.DeliveryMissing, groundhog.DeliveryAccepted} {
+		for _, s := range deliveryOrder {
 			if counts[s] > 0 {
-				parts = append(parts, fmt.Sprintf("%d %s", counts[s], strings.ReplaceAll(string(s), "_", " ")))
+				parts = append(parts, fmt.Sprintf("%d %s", counts[s], s))
+			}
+		}
+		for s, k := range counts {
+			if !s.Known() {
+				parts = append(parts, fmt.Sprintf("%d %s", k, short(string(s), 20)))
 			}
 		}
 		fmt.Fprintf(p, "Deliveries: %s\n", strings.Join(parts, ", "))
 		listed := 0
 		for _, d := range st.Deliveries {
-			if d.State == groundhog.DeliveryAccepted {
+			if d.State == groundhog.DeliveryAccepted || d.State == groundhog.DeliveryDelivered {
 				continue
 			}
 			if listed == 5 {
@@ -522,11 +454,6 @@ func statusPreview(p *strings.Builder, iv core.InstanceView, beat beatReading) {
 			}
 			listed++
 			fmt.Fprintf(p, "  %s\n", deliveryLine(d))
-		}
-		if settled(st) {
-			// An --active read leaves these out of the list: say so, so a reader
-			// does not take the missing list for the whole story.
-			fmt.Fprintf(p, "Settled: %d accepted, %d missing (not listed)\n", st.Settled.Accepted, st.Settled.Missing)
 		}
 	}
 	for _, d := range st.Diagnostics {
@@ -539,37 +466,29 @@ func statusPreview(p *strings.Builder, iv core.InstanceView, beat beatReading) {
 	case iv.Health == core.HealthStale:
 		p.WriteString(" (stale: not re-read although it should have been)")
 	}
-	fmt.Fprintf(p, "\nRevision %d", st.Revision)
-	if st.JournalGeneration != nil {
-		fmt.Fprintf(p, ", journal generation %d", *st.JournalGeneration)
-	}
 	p.WriteString("\n")
 }
 
-// deliveryLine is one delivery as one line: where it is, its state, why, and
-// the newest attempt's outcome.
+// deliveryLine is one delivery as one line: where it is, its state's glyph
+// and word, its newest attempt, and its run's log.
 func deliveryLine(d groundhog.Delivery) string {
-	s := short(d.Path, 120) + ": " + strings.ReplaceAll(string(d.State), "_", " ")
-	if d.Reason != nil {
-		s += " (" + short(*d.Reason, 120) + ")"
-	}
+	s := short(d.Path, 120) + ": " + deliveryGlyph(d.State) + " " + short(string(d.State), 20)
 	if k := len(d.Attempts); k > 0 {
 		a := d.Attempts[k-1]
-		s += fmt.Sprintf("; attempt %d of %d %s", k, k, strings.ReplaceAll(a.Outcome, "_", " "))
-		if a.ExitCode != nil {
-			s += fmt.Sprintf(", exit status %d", *a.ExitCode)
+		s += fmt.Sprintf("; attempt %d", k)
+		if a.By != "" {
+			s += " by " + short(a.By, 10)
 		}
-		if a.Signal != nil {
-			s += ", signal " + short(*a.Signal, 20)
+		if a.StartedAt != nil {
+			s += ", started " + clock(a.StartedAt.Local())
 		}
-		if e := problemText(a.Error); e != "" {
-			s += ", " + e
+		if a.ExitStatus != nil {
+			s += fmt.Sprintf(", exit status %d", *a.ExitStatus)
 		}
-		if a.OwnerLabel != nil && *a.OwnerLabel != "" {
-			// Whose call it was, as the record says (Groundhog keeps it after the owner
-			// has gone, so an unresolved attempt still names who admitted it).
-			s += ", admitted by " + short(*a.OwnerLabel, 60)
-		}
+	}
+	if d.Log != nil {
+		// A fired one-shot has no row of its own, so this names where its output is.
+		s += "; log " + short(*d.Log, 120)
 	}
 	return s
 }
@@ -586,96 +505,51 @@ func instanceBadge(iv core.InstanceView) string {
 	}
 	st := last.Status
 	var parts []string
-	switch {
-	case iv.Inspection.Err != nil: // the failure is shown in the tree row; the old status says nothing about trust
-	case iv.Health == core.HealthStale:
+	if iv.Inspection.Err == nil && iv.Health == core.HealthStale {
 		parts = append(parts, "stale")
-	case iv.Health == core.HealthInconsistent:
-		parts = append(parts, "inconsistent")
-	}
-	if v, ok := core.PendingVerdict(iv); ok {
-		if b := verdictBadge(v); b != "" {
-			parts = append(parts, b)
-		}
 	}
 	if len(st.Schedule) > 0 { // an empty count says nothing: a blank says it
 		parts = append(parts, plural(len(st.Schedule), "item", "items"))
 	}
 	counts := st.DeliveryCounts()
-	pending := counts[groundhog.DeliveryPending] + counts[groundhog.DeliveryInFlight]
-	failed := failedCount(st)
-	if pending > 0 {
-		parts = append(parts, fmt.Sprintf("%d pending", pending))
+	if k := counts[groundhog.DeliveryRunning]; k > 0 {
+		parts = append(parts, fmt.Sprintf("%d running", k))
 	}
-	if failed > 0 {
-		parts = append(parts, fmt.Sprintf("%d failed", failed))
+	if k := counts[groundhog.DeliveryPending]; k > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending", k))
+	}
+	if k := failedCount(st); k > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed", k))
 	}
 	return strings.Join(parts, " · ")
 }
 
-// verdictBadge is the verdict in a few words for the tree, or "" when nothing
-// has been seen ticking the instance: a missing heartbeat mark after the state
-// word already says that, and a row says only what matters. It carries no
-// tick age either: the mark says how recent the tick looks, and the preview
-// keeps the exact age with the read time and the fuller sentence.
-func verdictBadge(v core.Verdict) string {
-	switch v.Outlook {
-	case core.OutlookNo:
-		return "paused: won't run"
-	case core.OutlookYes:
-		if v.HandoffsWait() {
-			return "items run, handoffs wait"
-		}
-		return "will run"
-	case core.OutlookProbably:
-		if v.HandoffsWait() {
-			return "probably, handoffs wait"
-		}
-		return "probably"
-	}
-	return ""
-}
-
 // verdictPreview is the verdict as a sentence with what it rests on, short
-// enough to show whole in the 80x24 preview.
-func verdictPreview(v core.Verdict) string {
+// enough to show whole in the 80x24 preview. The read's time is given in loc,
+// the zone the preview's other times use (the script reports UTC).
+func verdictPreview(v core.Verdict, loc *time.Location) string {
 	tick := ""
 	if v.HasTick {
-		tick = fmt.Sprintf("%s before the %s read", ageText(v.Age), clock(v.ObservedAt))
-	}
-	if v.HandoffsWait() {
-		return handoffsWait(v, tick)
+		tick = fmt.Sprintf("%s before the %s read", ageText(v.Age), clock(v.ObservedAt.In(loc)))
 	}
 	switch v.Outlook {
 	case core.OutlookNo:
 		return "Pending work: no, the instance is paused."
 	case core.OutlookYes:
 		if tick == "" {
-			return "Pending work: yes, this session's runner is running (no tick recorded yet)."
+			return "Pending work: yes, this session ticks it (no tick recorded yet)."
 		}
-		return "Pending work: yes, this session's runner ticked " + tick + "."
+		return "Pending work: yes, this session ticks it; last tick " + tick + "."
 	case core.OutlookProbably:
 		return "Pending work: probably, something outside Easyhog ticked it " + tick + "."
 	}
-	if tick == "" {
+	switch {
+	case tick == "":
 		return "Pending work: nothing seen ticking it; no tick recorded."
+	case v.Ours:
+		return "Pending work: nothing seen ticking it since this session stopped; its last tick " + tick + "."
 	}
 	return "Pending work: nothing seen ticking it; last tick " + tick + "."
-}
-
-// handoffsWait is the verdict when an uncertain delivery has raised Groundhog's
-// barrier: items fire, but no handoff is made until each
-// uncertain delivery is recovered, so it is not a plain yes.
-func handoffsWait(v core.Verdict, tick string) string {
-	text := "Pending work: items fire, but handoffs wait until " + plural(v.Uncertain, "uncertain delivery is", "uncertain deliveries are") + " recovered"
-	who := "this session's runner"
-	if v.Outlook == core.OutlookProbably {
-		who = "something outside Easyhog"
-	}
-	if tick == "" {
-		return text + " (" + who + " is running; no tick recorded yet)."
-	}
-	return text + " (" + who + " ticked " + tick + ")."
 }
 
 // ageText is a duration in the fewest readable units.
@@ -726,8 +600,6 @@ var blockedWords = map[string]string{
 	"not_due":         "not due yet",
 	"already_fired":   "already fired for this slot",
 	"instance_paused": "the instance is paused",
-	"owned":           "an owner is recorded",
-	"invalid_state":   "the instance's state is invalid",
 }
 
 func blockedText(codes []string) string {
@@ -860,7 +732,7 @@ func itemNames(paths []string) []string {
 // under the instance, "schedule/daily/x", without a `.paused` on its own folder)
 // in both the status and the listing form, so a row keeps its selection when the
 // status arrives after the listing and when the item is paused or unpaused.
-func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool) []Node {
+func scheduleNodes(iv core.InstanceView, tick *core.TickInfo, acting bool) []Node {
 	var out []Node
 	inst := iv.Instance.Path
 	if last := iv.Inspection.Last; last != nil && iv.Class != core.ClassLegacy {
@@ -881,53 +753,60 @@ func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool)
 			// With a clash, a row owns only the deliveries stamped with its own path.
 			name := names[i]
 			_, clash := core.ItemClash(st, it.Path)
-			n := Node{Key: inst + "#" + name, Label: labels[i], State: StateScheduled,
-				Payload: &PayloadRef{Instance: inst, Rel: it.Path}}
+			ref := &PayloadRef{Instance: inst, Rel: it.Path}
+			n := Node{Key: inst + "#" + name, Label: labels[i], State: StateScheduled, Payload: ref}
 			own := false
 			for _, by := range it.PausedBy {
 				own = own || by == it.Path
 			}
-			var failedDelivery, waiting bool
+			var failedDelivery, running, waiting bool
 			var related []groundhog.Delivery
 			for _, d := range st.Deliveries {
 				if d.SchedulePath != nil && (*d.SchedulePath == it.Path || !clash && core.ItemIdentity(*d.SchedulePath) == name) {
 					related = append(related, d)
 					failedDelivery = failedDelivery || failedState(d.State)
-					waiting = waiting || d.State == groundhog.DeliveryPending || d.State == groundhog.DeliveryInFlight
+					running = running || d.State == groundhog.DeliveryRunning
+					waiting = waiting || d.State == groundhog.DeliveryPending
+				}
+			}
+			// The newest deliveries' logs go to the payload reader, newest first.
+			slices.SortStableFunc(related, func(a, b groundhog.Delivery) int { return compareFired(b, a) })
+			for _, d := range related {
+				if d.Log != nil {
+					ref.Logs = append(ref.Logs, *d.Log)
 				}
 			}
 			word := dueWord(it)
 			switch {
 			case failedDelivery:
 				n.State = StateFailed
+			case running:
+				n.State = StateRunning // its run is going now
 			case len(it.PausedBy) > 0:
 				n.State = StatePaused
 			case waiting:
-				// A delivery of this item waits for its hand-over: the one thing
-				// "pending" means (the badge counts these too). Otherwise the item
-				// is merely scheduled.
+				// A delivery of this item waits for its run to start: the one thing
+				// "pending" means. Otherwise the item is merely scheduled.
 				n.State = StatePending
 			}
 			n.Detail = cadenceText(it.Cadence) + ", " + word
 			n.Badge, n.Due = itemBadge(it, word)
-			// The settling actions an item offers are its own deliveries' (the
-			// same core.OffersOn rule as the instance's, limited to this item).
-			var settleOffer, toggleOffer []Action
+			// Retry on an item is its own deliveries' (the same core.OffersOn rule as
+			// the instance's, limited to this item).
+			var retryOffer, toggleOffer []Action
 			var toggleWhy string
-			if supervised {
-				actions, _ := core.OffersOn(iv, info, name)
-				for _, a := range actions {
-					if a.Settles() {
-						settleOffer = append(settleOffer, Action(a))
-					}
+			if acting {
+				actions, _ := controls(iv, tick, acting, name)
+				if slices.Contains(actions, ActionRetry) {
+					retryOffer = []Action{ActionRetry}
 				}
 				var toggles []core.Action
-				toggles, toggleWhy = core.ItemOffers(iv, info, it.Path)
+				toggles, toggleWhy = core.ItemOffers(iv, it.Path)
 				for _, a := range toggles {
 					toggleOffer = append(toggleOffer, Action(a))
 				}
-				n.Actions = append(append(n.Actions, toggleOffer...), settleOffer...)
-				n.ActionNotes = settleNotes(settleOffer, st, name)
+				n.Actions = append(append(n.Actions, toggleOffer...), retryOffer...)
+				n.ActionNotes = retryNotes(retryOffer, st, name)
 				for _, a := range toggleOffer {
 					if n.ActionNotes == nil {
 						n.ActionNotes = map[Action]string{}
@@ -946,7 +825,7 @@ func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool)
 			p.WriteString("\n")
 			if it.NextDue != nil {
 				fmt.Fprintf(&p, "Next due: %s\n", it.NextDue.Local().Format("Mon 2 Jan 2006 15:04:05 MST"))
-				p.WriteString("The row counts down to this. The runner fires the item on its first tick at or after it, so with a 60 s tick that can be up to a minute later.\n")
+				p.WriteString("The row counts down to this. Groundhog fires the item on the first tick at or after it, so with a 60 s tick that can be up to a minute later.\n")
 			}
 			switch {
 			case own:
@@ -963,7 +842,7 @@ func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool)
 			case len(toggleOffer) > 0:
 				fmt.Fprintf(&p, "Palette offers: %s (renames its folder to %s)\n",
 					actionNames(toggleOffer), short(path.Base(core.ItemTarget(it.Path, toggleOffer[0] == ActionPauseItem)), 60))
-			case supervised && toggleWhy != "":
+			case acting && toggleWhy != "":
 				fmt.Fprintf(&p, "Pausing is not offered: %s\n", short(toggleWhy, 300))
 			}
 			if len(it.BlockedBy) > 0 {
@@ -972,11 +851,11 @@ func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool)
 			for _, d := range related {
 				fmt.Fprintf(&p, "Delivery: %s\n", deliveryLine(d))
 			}
-			if len(settleOffer) > 0 {
-				fmt.Fprintf(&p, "Palette offers: %s (this item's deliveries only)\n", actionNames(settleOffer))
+			if len(retryOffer) > 0 {
+				fmt.Fprintf(&p, "Palette offers: %s (this item's deliveries only)\n", actionNames(retryOffer))
 			}
-			if settled(st) {
-				p.WriteString("Settled deliveries (accepted or missing) are counted, not listed: only unfinished ones appear above.\n")
+			if note := retryExplanation(iv, retryOffer, name); note != "" {
+				p.WriteString(note + "\n")
 			}
 			fmt.Fprintf(&p, "\nAs of %s", clock(last.TakenAt))
 			if w := healthWord(iv); w != core.HealthOK.String() {
@@ -1006,4 +885,18 @@ func scheduleNodes(iv core.InstanceView, info *core.RunnerInfo, supervised bool)
 		out = append(out, n)
 	}
 	return out
+}
+
+// compareFired orders deliveries by when they fired (an unrecorded one first),
+// then by path.
+func compareFired(a, b groundhog.Delivery) int {
+	switch {
+	case a.FiredAt == nil && b.FiredAt != nil:
+		return -1
+	case a.FiredAt != nil && b.FiredAt == nil:
+		return 1
+	case a.FiredAt != nil && !a.FiredAt.Equal(*b.FiredAt):
+		return a.FiredAt.Compare(*b.FiredAt)
+	}
+	return strings.Compare(a.Path, b.Path)
 }

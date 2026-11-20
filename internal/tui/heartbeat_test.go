@@ -15,60 +15,66 @@ import (
 // Tests for the heartbeat: a small mark after the state word of a row something
 // drives, coloured by how recent the tick looks, and no tick age in the badge.
 
-func heartbeatNode(v core.InstanceView, info *core.RunnerInfo) Node {
-	infos := map[string]core.RunnerInfo{}
-	if info != nil {
-		infos[v.Instance.Path] = *info
+// here is what the ticker says of an instance this session ticks, on interval
+// (the default when zero).
+func here(interval time.Duration) *core.TickInfo {
+	if interval == 0 {
+		interval = core.DefaultTickInterval
 	}
-	return FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookup(infos)).Nodes[0]
+	return &core.TickInfo{Ticking: true, Interval: interval}
 }
 
-func heartbeatRow(t *testing.T, v core.InstanceView, info *core.RunnerInfo, width int) string {
-	t.Helper()
-	infos := map[string]core.RunnerInfo{}
-	if info != nil {
-		infos[v.Instance.Path] = *info
+func lookupOf(v core.InstanceView, info *core.TickInfo) TickLookup {
+	return func(key string) (core.TickInfo, bool) {
+		if info == nil || key != v.Instance.Path {
+			return core.TickInfo{}, false
+		}
+		return *info, true
 	}
-	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookup(infos)))
+}
+
+func heartbeatNode(v core.InstanceView, info *core.TickInfo) Node {
+	return FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookupOf(v, info)).Nodes[0]
+}
+
+func heartbeatRow(t *testing.T, v core.InstanceView, info *core.TickInfo, width int) string {
+	t.Helper()
+	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{v}}, lookupOf(v, info)))
 	return ansi.Strip(m.treeRow(0, width))
 }
 
-// Only rows something drives get a mark: external (both kinds) and running.
+// Only rows something drives get a mark: external and running.
 func TestOnlyDrivenRowsGetAHeartbeat(t *testing.T) {
 	const s = time.Second
-	failedRun := withDeliveries(withTick(ours("a", groundhog.RunnerRunning, false), 10*s, "runner"), delivery("d-f", groundhog.DeliveryFailed, "", ""))
-	inconsistent := withTick(ours("a", groundhog.RunnerRunning, false), 10*s, "runner")
-	inconsistent.Health = core.HealthInconsistent
-	unsupported := withTick(unowned("a"), 10*s, "standalone")
+	failedRun := withDeliveries(withTick(supported("a"), 10*s, "standalone"), delivery("out/f", groundhog.DeliveryFailed, ""))
+	unsupported := withTick(supported("a"), 10*s, "standalone")
 	unsupported.Class = core.ClassUnsupported
 	cases := []struct {
 		name  string
 		v     core.InstanceView
+		info  *core.TickInfo
 		state State
 		want  core.Heartbeat
 	}{
-		{"running here, ticked", withTick(ours("a", groundhog.RunnerRunning, false), 10*s, "runner"), StateRunning, core.HeartbeatFresh},
-		{"running here, no tick recorded yet", ours("a", groundhog.RunnerRunning, false), StateRunning, core.HeartbeatNone},
-		{"external, owned elsewhere, ticked", withTick(ownedElsewhere("a", "ci"), 10*s, "runner"), StateExternal, core.HeartbeatFresh},
-		{"external, owned elsewhere, no tick", ownedElsewhere("a", "ci"), StateExternal, core.HeartbeatNone},
-		{"external, ticked from outside", withTick(unowned("a"), 10*s, "standalone"), StateExternal, core.HeartbeatFresh},
-		{"paused runner", withTick(ours("a", groundhog.RunnerRunning, true), 10*s, "runner"), StatePaused, core.HeartbeatNone},
-		{"enrolled, no runner", withTick(ours("a", groundhog.RunnerStopped, false), 10*s, "runner"), StateStopped, core.HeartbeatNone},
-		{"not enrolled, old tick", withTick(unowned("a"), 10*time.Minute, "standalone"), StateStopped, core.HeartbeatNone},
-		{"failed", failedRun, StateFailed, core.HeartbeatNone},
-		{"inconsistent", inconsistent, StateInconsistent, core.HeartbeatNone},
-		{"unsupported", unsupported, StateUnsupported, core.HeartbeatNone},
-		{"not inspected", iv("a", core.ClassNotInspected, core.HealthOK, core.Inspection{}), StateStopped, core.HeartbeatNone},
+		{"running here, ticked", withTick(supported("a"), 10*s, "standalone"), here(0), StateRunning, core.HeartbeatFresh},
+		{"running here, no tick recorded yet", supported("a"), here(0), StateRunning, core.HeartbeatNone},
+		{"external, a run loop", withTick(supported("a"), 10*s, "runner"), nil, StateExternal, core.HeartbeatFresh},
+		{"external, ticked from outside", withTick(supported("a"), 10*s, "standalone"), nil, StateExternal, core.HeartbeatFresh},
+		{"paused", withTick(pausedInstance("a"), 10*s, "standalone"), here(0), StatePaused, core.HeartbeatNone},
+		{"not ticked, old tick", withTick(supported("a"), 10*time.Minute, "standalone"), nil, StateStopped, core.HeartbeatNone},
+		{"failed", failedRun, here(0), StateFailed, core.HeartbeatNone},
+		{"unsupported", unsupported, nil, StateUnsupported, core.HeartbeatNone},
+		{"not inspected", iv("a", core.ClassNotInspected, core.HealthOK, core.Inspection{}), nil, StateStopped, core.HeartbeatNone},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			n := heartbeatNode(c.v, nil)
+			n := heartbeatNode(c.v, c.info)
 			if n.State != c.state || n.Heartbeat != c.want {
 				t.Errorf("state %s heartbeat %v, want %s and %v", n.State.label(), n.Heartbeat, c.state.label(), c.want)
 			}
 			dot := heartbeatGlyph(c.want)
 			if !n.Hidden { // an unsupported instance's row is hidden by default
-				row := strings.TrimRight(heartbeatRow(t, c.v, nil, 90), " ")
+				row := strings.TrimRight(heartbeatRow(t, c.v, c.info, 90), " ")
 				if (dot != "") != strings.HasSuffix(row, " "+dot) {
 					t.Errorf("row %q, want a trailing %q: %v", row, dot, dot != "")
 				}
@@ -84,27 +90,25 @@ func TestOnlyDrivenRowsGetAHeartbeat(t *testing.T) {
 // interval, anything else against 60 s.
 func TestHeartbeatLevelsFollowTheTickAgeAndTheExpectedInterval(t *testing.T) {
 	const s = time.Second
+	ours := func(age time.Duration) core.InstanceView { return withTick(supported("a"), age, "standalone") }
 	cases := []struct {
 		name string
 		v    core.InstanceView
-		info *core.RunnerInfo
+		info *core.TickInfo
 		want core.Heartbeat
 	}{
-		{"our runner, 90 s on the default", withTick(ours("a", groundhog.RunnerRunning, false), 90*s, "runner"), nil, core.HeartbeatFresh},
-		{"our runner, 91 s on the default", withTick(ours("a", groundhog.RunnerRunning, false), 91*s, "runner"), nil, core.HeartbeatLate},
-		{"our runner, 3 min", withTick(ours("a", groundhog.RunnerRunning, false), core.TickFreshness, "runner"), nil, core.HeartbeatLate},
-		{"our runner, stuck in a long consumer call", withTick(ours("a", groundhog.RunnerRunning, false), core.TickFreshness+s, "runner"), nil, core.HeartbeatQuiet},
-		{"our runner on a 20 s interval, 30 s", withTick(ours("a", groundhog.RunnerRunning, false), 30*s, "runner"), &core.RunnerInfo{Interval: 20 * s}, core.HeartbeatFresh},
-		{"our runner on a 20 s interval, 31 s", withTick(ours("a", groundhog.RunnerRunning, false), 31*s, "runner"), &core.RunnerInfo{Interval: 20 * s}, core.HeartbeatLate},
-		{"our runner on a 5 min interval, 4 min", withTick(ours("a", groundhog.RunnerRunning, false), 4*time.Minute, "runner"), &core.RunnerInfo{Interval: 5 * time.Minute}, core.HeartbeatFresh},
-		{"a runner interval of zero means the default", withTick(ours("a", groundhog.RunnerRunning, false), 91*s, "runner"), &core.RunnerInfo{}, core.HeartbeatLate},
-		{"outside, 40 s", withTick(unowned("a"), 40*s, "standalone"), nil, core.HeartbeatFresh},
-		{"outside, 2 min", withTick(unowned("a"), 2*time.Minute, "standalone"), nil, core.HeartbeatLate},
-		{"outside, at the window's edge", withTick(unowned("a"), core.TickFreshness, "standalone"), nil, core.HeartbeatLate},
-		{"enrolled elsewhere, a dead leftover owner", withTick(ownedElsewhere("a", "gone"), 20*time.Minute, "runner"), nil, core.HeartbeatQuiet},
-		{"enrolled elsewhere, a live one", withTick(ownedElsewhere("a", "live"), 20*s, "runner"), nil, core.HeartbeatFresh},
-		// An external row never reads the runner's interval, even if a lookup has one.
-		{"owned elsewhere ignores a runner's interval", withTick(ownedElsewhere("a", "ci"), 31*s, "runner"), &core.RunnerInfo{Interval: 10 * s}, core.HeartbeatFresh},
+		{"ticked here, 90 s on the default", ours(90 * s), here(0), core.HeartbeatFresh},
+		{"ticked here, 91 s on the default", ours(91 * s), here(0), core.HeartbeatLate},
+		{"ticked here, 3 min", ours(core.TickFreshness), here(0), core.HeartbeatLate},
+		{"ticked here, quiet: the tick is stuck", ours(core.TickFreshness + s), here(0), core.HeartbeatQuiet},
+		{"ticked here every 20 s, 30 s", ours(30 * s), here(20 * s), core.HeartbeatFresh},
+		{"ticked here every 20 s, 31 s", ours(31 * s), here(20 * s), core.HeartbeatLate},
+		{"ticked here every 5 min, 4 min", ours(4 * time.Minute), here(5 * time.Minute), core.HeartbeatFresh},
+		{"an interval of zero means the default", ours(91 * s), &core.TickInfo{Ticking: true}, core.HeartbeatLate},
+		{"outside, 40 s", withTick(supported("a"), 40*s, "standalone"), nil, core.HeartbeatFresh},
+		{"outside, 2 min", withTick(supported("a"), 2*time.Minute, "standalone"), nil, core.HeartbeatLate},
+		{"outside, at the window's edge", withTick(supported("a"), core.TickFreshness, "standalone"), nil, core.HeartbeatLate},
+		{"a run loop, 20 s", withTick(supported("a"), 20*s, "runner"), nil, core.HeartbeatFresh},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -119,7 +123,7 @@ func TestHeartbeatLevelsFollowTheTickAgeAndTheExpectedInterval(t *testing.T) {
 // the badge separator and the others, and one cell wide, so colour off still tells them apart.
 func TestHeartbeatGlyphsAreDistinctAndOneCellWide(t *testing.T) {
 	taken := map[string]string{"▶": "palette Run", "■": "palette Stop", "·": "badge separator", "●": "state"}
-	for st := StateStopped; st <= StateInconsistent; st++ {
+	for st := StateStopped; st <= StateScheduled; st++ {
 		taken[st.glyph()] = "state " + st.label()
 	}
 	seen := map[string]core.Heartbeat{}
@@ -153,7 +157,7 @@ func TestTheHeartbeatColoursTheMarkNotTheWord(t *testing.T) {
 		t.Error("none has a style")
 	}
 	// Both an external row's word and a running row's keep their state colour whatever the level.
-	for _, v := range []core.InstanceView{withTick(unowned("a"), 10*time.Second, "standalone"), withTick(unowned("a"), 100*time.Second, "standalone")} {
+	for _, v := range []core.InstanceView{withTick(supported("a"), 10*time.Second, "standalone"), withTick(supported("a"), 100*time.Second, "standalone")} {
 		n := heartbeatNode(v, nil)
 		if n.State != StateExternal || !sameColour(s.state[n.State], s.state[StateExternal]) {
 			t.Errorf("state %s", n.State.label())
@@ -168,15 +172,16 @@ func TestTheMarkSitsRightAfterTheStateWordInTheRow(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		v    core.InstanceView
+		info *core.TickInfo
 		want string
 	}{
-		{"fresh", withTick(ours("alpha", groundhog.RunnerRunning, false), 10*s, "runner"), "running • "},
-		{"late", withTick(ours("alpha", groundhog.RunnerRunning, false), 100*s, "runner"), "running ◦ "},
-		{"quiet", withTick(ours("alpha", groundhog.RunnerRunning, false), 10*time.Minute, "runner"), "running ∙ "},
-		{"external, late", withTick(unowned("alpha"), 100*s, "standalone"), "external ◦ "},
+		{"fresh", withTick(supported("alpha"), 10*s, "standalone"), here(0), "running • "},
+		{"late", withTick(supported("alpha"), 100*s, "standalone"), here(0), "running ◦ "},
+		{"quiet", withTick(supported("alpha"), 10*time.Minute, "standalone"), here(0), "running ∙ "},
+		{"external, late", withTick(supported("alpha"), 100*s, "standalone"), nil, "external ◦ "},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			row := heartbeatRow(t, c.v, nil, 80)
+			row := heartbeatRow(t, c.v, c.info, 80)
 			if !strings.HasSuffix(row, c.want) || ansi.Strip(row) != row {
 				t.Errorf("row %q, want it to end %q", row, c.want)
 			}
@@ -189,19 +194,20 @@ func TestTheMarkSitsRightAfterTheStateWordInTheRow(t *testing.T) {
 
 // The tick age has left the badge for every verdict.
 func TestTheBadgeCarriesNoTickAge(t *testing.T) {
-	for name, v := range map[string]core.InstanceView{
-		"will run":        withTick(ours("a", groundhog.RunnerRunning, false), 12*time.Second, "runner"),
-		"probably":        withTick(unowned("a"), 45*time.Second, "standalone"),
-		"handoffs wait":   withTick(withDeliveries(ours("a", groundhog.RunnerRunning, false), uncertainA), 12*time.Second, "runner"),
-		"probably, waits": withTick(withDeliveries(unowned("a"), uncertainA), 45*time.Second, "standalone"),
-		"quiet":           withTick(unowned("a"), 25*time.Minute, "standalone"),
+	for name, c := range map[string]struct {
+		v    core.InstanceView
+		info *core.TickInfo
+	}{
+		"running here": {withTick(supported("a"), 12*time.Second, "standalone"), here(0)},
+		"outside":      {withTick(supported("a"), 45*time.Second, "standalone"), nil},
+		"quiet":        {withTick(supported("a"), 25*time.Minute, "standalone"), nil},
 	} {
-		b := heartbeatNode(v, nil).Badge
-		if strings.Contains(b, "12s") || strings.Contains(b, "45s") || strings.Contains(b, "25m") || strings.Contains(b, "tick 0") || strings.Contains(b, ", tick") {
+		b := heartbeatNode(c.v, c.info).Badge
+		if strings.Contains(b, "12s") || strings.Contains(b, "45s") || strings.Contains(b, "25m") || strings.Contains(b, ", tick") {
 			t.Errorf("%s: badge %q carries an age", name, b)
 		}
 	}
-	if b := heartbeatNode(withTick(ours("a", groundhog.RunnerRunning, false), 12*time.Second, "runner"), nil).Badge; b != "will run" { // no items: the badge says nothing about them
+	if b := heartbeatNode(withTick(supported("a"), 12*time.Second, "standalone"), here(0)).Badge; b != "" { // no items, and the verdict stays out of the badge
 		t.Errorf("badge %q", b)
 	}
 }
@@ -209,10 +215,10 @@ func TestTheBadgeCarriesNoTickAge(t *testing.T) {
 // At narrow widths the label gives way first, then the badge, then the state
 // word; the mark goes with the word and is never left alone or cut in half.
 func TestTheMarkStaysWithTheStateWordInANarrowRow(t *testing.T) {
-	v := withTick(ours("a-long-instance-name", groundhog.RunnerRunning, false), 10*time.Second, "runner")
+	v := withTick(supported("a-long-instance-name"), 10*time.Second, "standalone")
 	sawBoth, sawNeither := false, false
 	for w := 14; w <= 100; w++ {
-		row := heartbeatRow(t, v, nil, w)
+		row := heartbeatRow(t, v, here(0), w)
 		if lipgloss.Width(row) > w {
 			t.Fatalf("width %d: row is %d cells: %q", w, lipgloss.Width(row), row)
 		}
@@ -227,7 +233,7 @@ func TestTheMarkStaysWithTheStateWordInANarrowRow(t *testing.T) {
 			}
 		}
 		// The label is cut before the badge, and the badge before the word (the old rule, kept).
-		if strings.Contains(row, "will run") && !word {
+		if strings.Contains(row, "1 pending") && !word {
 			t.Errorf("width %d: badge outlasted the state word: %q", w, row)
 		}
 	}
@@ -241,17 +247,17 @@ func TestTheMarkStaysWithTheStateWordInANarrowRow(t *testing.T) {
 // age still in the verdict line.
 func TestThePreviewNamesTheHeartbeatAndKeepsTheExactAge(t *testing.T) {
 	const s = time.Second
-	own := withTick(ours("a", groundhog.RunnerRunning, false), 100*s, "runner")
-	n := heartbeatNode(own, &core.RunnerInfo{Interval: 20 * s})
+	own := withTick(supported("a"), 100*s, "standalone")
+	n := heartbeatNode(own, here(20*s))
 	for _, want := range []string{
-		"Heartbeat: late, judged against a tick expected every 20s (this session's runner's interval): fresh up to 30s, late up to 3m00s.",
-		"Pending work: yes, this session's runner ticked 1m40s before the 09:30:15 read.",
+		"Heartbeat: late, judged against a tick expected every 20s (the interval this session ticks it at): fresh up to 30s, late up to 3m00s.",
+		"Pending work: yes, this session ticks it; last tick 1m40s before the 09:30:15 read.",
 	} {
 		if !strings.Contains(n.Preview, want) {
 			t.Errorf("preview lacks %q:\n%s", want, n.Preview)
 		}
 	}
-	out := heartbeatNode(withTick(unowned("a"), 40*s, "standalone"), nil).Preview
+	out := heartbeatNode(withTick(supported("a"), 40*s, "standalone"), nil).Preview
 	if want := "Heartbeat: fresh, judged against a tick expected every 1m00s (assumed for something outside Easyhog, since Groundhog reports no interval): fresh up to 1m30s, late up to 3m00s."; !strings.Contains(out, want) {
 		t.Errorf("preview lacks %q:\n%s", want, out)
 	}
@@ -260,26 +266,18 @@ func TestThePreviewNamesTheHeartbeatAndKeepsTheExactAge(t *testing.T) {
 	}
 
 	// The header: state word, then the mark, then the rest.
-	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{own}}, lookup(nil)))
+	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{own}}, lookupOf(own, here(20*s))))
 	lines := m.previewLines(100)
-	if len(lines) < 2 || !strings.HasPrefix(ansi.Strip(lines[1]), "running ◦ · running") {
+	if len(lines) < 2 || !strings.HasPrefix(ansi.Strip(lines[1]), "running ◦ · inspected 09:30:15") {
 		t.Errorf("preview header %q", lines)
 	}
 }
 
 // A row with no mark keeps its preview header as it was.
 func TestAStoppedRowsPreviewHeaderHasNoMark(t *testing.T) {
-	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{unowned("a")}}, lookup(nil)))
+	m := NewWithData(FromViewWith(core.View{Root: "/r", Instances: []core.InstanceView{supported("a")}}, ticks()))
 	lines := m.previewLines(100)
-	if len(lines) < 2 || !strings.HasPrefix(ansi.Strip(lines[1]), "stopped · not enrolled") {
+	if len(lines) < 2 || !strings.HasPrefix(ansi.Strip(lines[1]), "stopped · not ticked") {
 		t.Errorf("preview header %q", lines)
-	}
-}
-
-// Run's confirmation question keeps the tick age.
-func TestRunsQuestionKeepsItsAge(t *testing.T) {
-	r := outsideRig(t, &fakeRunners{})
-	if q := r.m.rows[0].node.RunConfirm; !strings.Contains(q, "ticked alpha 45s before the last read") {
-		t.Errorf("question %q", q)
 	}
 }

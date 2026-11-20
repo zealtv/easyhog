@@ -33,7 +33,7 @@ const (
 	// lineField is "Label: value" for a label the adapter writes. The value
 	// starts at the returned index.
 	lineField
-	// lineDelivery is an indented "path: state; attempt …" line listed under
+	// lineDelivery is an indented "path: glyph state; attempt …" line listed under
 	// Deliveries. The text after "path: " starts at the returned index.
 	lineDelivery
 	// lineMore is the indented "… more not listed" line.
@@ -43,10 +43,9 @@ const (
 // fieldLabels are the labels adapt.go puts before a colon.
 // A line whose text before ": " is not in this list is not a field.
 var fieldLabels = []string{
-	"Kind", "Palette offers", "This session's runner", "Support", "Ownership", "Pause", "Runner",
-	"Runner's last error", "Consumer", "Schedule", "Deliveries", "Settled", "Diagnostic",
+	"Kind", "Palette offers", "Support", "Pause", "Schedule", "Deliveries", "Diagnostic",
 	"Last inspected", "From directory listings (nothing run)", "Listing problem", "Pending work", "Heartbeat",
-	"Item id", "Cadence", "Due", "Firing held", "Delivery", "Run and Stop are not offered",
+	"Item id", "Cadence", "Due", "Firing held", "Delivery", "Nothing is offered",
 	"Pausing is not offered", "Next due",
 }
 
@@ -86,7 +85,7 @@ func classifyPreviewLine(line string, first bool) (previewKind, int) {
 }
 
 // valueRE finds what a field's value may colour: a clock time, or a state word.
-var valueRE = regexp.MustCompile(`\b(?:\d{2}:\d{2}:\d{2}|running|paused|failed|pending|uncertain)\b`)
+var valueRE = regexp.MustCompile(`\b(?:\d{2}:\d{2}:\d{2}|running|paused|failed|pending|interrupted)\b`)
 
 var stateWordStyle = map[string]State{
 	"running": StateRunning, "paused": StatePaused, "failed": StateFailed, "pending": StatePending,
@@ -106,8 +105,8 @@ func valueSpans(text string, words bool, st styles) []span {
 			style, id = st.faint, "time"
 		case !words:
 			continue
-		case found == "uncertain":
-			style, id = st.warn, "word:uncertain"
+		case found == "interrupted":
+			style, id = st.warn, "word:interrupted"
 		default:
 			style, id = st.state[stateWordStyle[found]], "word:"+found
 		}

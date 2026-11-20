@@ -7,8 +7,8 @@ import (
 	"github.com/zealtv/easyhog/internal/groundhog"
 )
 
-// Class says what kind of instance this is, as far as it has been seen. It is
-// about support and ownership, never about control: no class grants an action.
+// Class says what kind of instance this is, as far as it has been seen: about
+// support, never about control. No class grants an action by itself.
 type Class int
 
 const (
@@ -19,18 +19,15 @@ const (
 	// never run.
 	ClassMalformed
 	// ClassLegacy: the script does not offer `status --json` at protocol
-	// version 1 (an older copy, an unknown version, malformed capabilities).
-	// Read-only; it stays unexecuted beyond `capabilities`.
+	// version 2 (an older Groundhog, an unknown version, malformed
+	// capabilities). Read-only; it stays unexecuted beyond `capabilities`.
 	ClassLegacy
-	// ClassUnsupported: the script reports status but lacks capabilities that
-	// supervised control needs. Read-only.
+	// ClassUnsupported: the script reports status but lacks what ticking,
+	// Retry and the pause need (a host without a lock helper, say). Read-only.
 	ClassUnsupported
-	// ClassUnowned: inspectable and capable, with no owner recorded.
-	ClassUnowned
-	// ClassOwnedBySession: an owner this session recognises as itself.
-	ClassOwnedBySession
-	// ClassExternal: an owner is recorded and it is not this session.
-	ClassExternal
+	// ClassSupported: inspectable, and Easyhog may tick it, retry its
+	// deliveries and pause it.
+	ClassSupported
 	// ClassFailing: no usable status could be read and none is kept.
 	ClassFailing
 )
@@ -43,12 +40,8 @@ func (c Class) String() string {
 		return "legacy"
 	case ClassUnsupported:
 		return "unsupported"
-	case ClassUnowned:
-		return "unowned"
-	case ClassOwnedBySession:
-		return "owned by this session"
-	case ClassExternal:
-		return "externally owned"
+	case ClassSupported:
+		return "supported"
 	case ClassFailing:
 		return "failing"
 	}
@@ -63,22 +56,16 @@ func (c Class) String() string {
 type Health int
 
 const (
-	// HealthOK: the newest read that succeeded was coherent.
+	// HealthOK: the newest read that succeeded is recent enough.
 	HealthOK Health = iota
 	// HealthStale: the selected instance has not been re-read for several
 	// poll intervals although it should have been.
 	HealthStale
-	// HealthInconsistent: the newest read stayed `consistent:false` through
-	// every retry. The status is shown, marked, and no control may use it.
-	HealthInconsistent
 )
 
 func (h Health) String() string {
-	switch h {
-	case HealthStale:
+	if h == HealthStale {
 		return "stale"
-	case HealthInconsistent:
-		return "inconsistent"
 	}
 	return "current"
 }
@@ -95,16 +82,13 @@ type Observation struct {
 type Inspection struct {
 	// Support is the last capability negotiation; nil until one has run.
 	Support *groundhog.Support
-	// Last is the newest status that could be read, coherent or not; nil if
-	// none ever was. Last.Status.Consistent says which.
+	// Last is the newest status that could be read; nil if none ever was.
 	Last *Observation
 	// Err is the newest attempt's failure, nil when it succeeded. A failure
 	// never discards Last.
 	Err error
 	// ErrAt is when Err happened.
 	ErrAt time.Time
-	// Attempts counts the status reads of the newest refresh (1 plus retries).
-	Attempts int
 }
 
 // InstanceView is one instance as the terminal should show it.

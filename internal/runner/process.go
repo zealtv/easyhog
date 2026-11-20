@@ -1,6 +1,6 @@
-// Package runner provides the subprocess boundary. Process runs the short,
-// bounded protocol calls and kills on cancellation; Spawner (launch.go) starts
-// a long-lived runner with file output and no kill. A supervisor uses both.
+// Package runner provides the subprocess boundary: Process runs the short,
+// bounded protocol calls (status, tick, retry, pause) and kills the direct
+// child on cancellation. Nothing here starts a long-lived process.
 package runner
 
 import (
@@ -27,9 +27,8 @@ type Executor interface {
 }
 
 // Process runs only an explicitly requested direct child. Cancellation kills
-// and waits for that child, not its descendants. That suits `status` and the
-// control commands and is wrong for a Groundhog `run`: use Spawner for it, which
-// never kills.
+// and waits for that child, not its descendants: a run that a tick started
+// lives in a session of its own and is never reached.
 type Process struct{}
 
 func (Process) Run(ctx context.Context, call Invocation) error {

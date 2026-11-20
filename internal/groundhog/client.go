@@ -16,10 +16,9 @@ import (
 
 // Defaults for one call. Callers override them per client or per call.
 const (
-	DefaultTimeout     = 30 * time.Second
-	DefaultStopTimeout = 60 * time.Second // upstream `stop` has no timeout of its own
-	DefaultMaxStdout   = 8 << 20
-	DefaultMaxStderr   = 64 << 10
+	DefaultTimeout   = 30 * time.Second
+	DefaultMaxStdout = 8 << 20
+	DefaultMaxStderr = 64 << 10
 )
 
 // Option adjusts the bounds of a client (New) or of one call.
@@ -71,8 +70,8 @@ func WithMaxStderr(n int) Option {
 
 // Client talks to one deployed Groundhog instance through that instance's own
 // script, by absolute path, with no shell and no PATH lookup. It never starts
-// `run` and never writes, replaces or upgrades a script. A Client is safe for
-// concurrent use.
+// the script's `run` loop and never writes, replaces or upgrades a script. A
+// Client is safe for concurrent use.
 type Client struct {
 	exec     runner.Executor
 	instance string
@@ -118,12 +117,6 @@ func (c *Client) offers(name string) bool {
 	return c.support != nil && c.support.Capabilities != nil && c.support.Capabilities.Has(name)
 }
 
-// Instance returns the instance directory this client was built for.
-func (c *Client) Instance() string { return c.instance }
-
-// Script returns the absolute script path every call runs.
-func (c *Client) Script() string { return c.script }
-
 func checkPath(what, p string) error {
 	switch {
 	case p == "":
@@ -147,9 +140,6 @@ func (c *Client) resolve(command string, opts []Option) (settings, error) {
 	}
 	if s.timeout == 0 {
 		s.timeout = DefaultTimeout
-		if command == "stop" {
-			s.timeout = DefaultStopTimeout
-		}
 	}
 	return s, nil
 }
@@ -209,8 +199,7 @@ func (w *capture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// run executes one command and returns its stdout when keepStdout is set. The
-// token is never an argument here: callers pass only `--token-file PATH`.
+// run executes one command and returns its stdout when keepStdout is set.
 func (c *Client) run(ctx context.Context, command string, args []string, keepStdout bool, opts []Option) ([]byte, error) {
 	s, err := c.resolve(command, opts)
 	if err != nil {

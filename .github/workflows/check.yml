@@ -23,7 +23,7 @@ jobs:
       - run: make check
       - if: runner.os == 'Linux'
         run: make cross-check
-      # The reader's whole session on real Groundhog runners (about 40 s). Its
-      # wake part stays skipped: EASYHOG_WAKE_CONSUMER is not set here.
+      # The reader's whole session with real ticks of the pinned Groundhog
+      # script and the example runs (under a minute).
       - if: runner.os == 'Linux'
         run: make acceptance

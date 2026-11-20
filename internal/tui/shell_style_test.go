@@ -22,7 +22,7 @@ func sameColour(a, b lipgloss.Style) bool {
 // A header count takes the hue of what it counts, the rows' own; the plain
 // text is what it was.
 func TestHeaderCountsTakeTheirRowsHuesAndReadTheSameWithColourOff(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	m := r.m
 	s := m.styles
 	if sameColour(s.state[StateRunning], s.state[StateFailed]) || sameColour(s.state[StatePaused], s.state[StateFailed]) {
@@ -46,7 +46,7 @@ func TestHeaderCountsTakeTheirRowsHuesAndReadTheSameWithColourOff(t *testing.T) 
 
 // Which pane has focus shows in the rule, not only in the label's colour.
 func TestFocusedPaneRuleIsHeavyAndTheOtherLight(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	r.send(tea.WindowSizeMsg{Width: 120, Height: 30})
 	screen := r.screen()
 	if !strings.Contains(screen, "━━ Instances") || !strings.Contains(screen, "── Preview") {
@@ -70,7 +70,7 @@ func TestFocusedPaneRuleIsHeavyAndTheOtherLight(t *testing.T) {
 // The hints sit three spaces apart, EasyLoom's way, with no dot between them,
 // and the line still shows as many pairs as fit.
 func TestHintLinePairsSitThreeSpacesApart(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	line := ansi.Strip(r.m.hintLine(100))
 	if strings.Contains(line, "·") {
 		t.Errorf("hint line still has dots: %q", line)
@@ -105,7 +105,7 @@ func TestPaletteGlyphsTakeTheHueOfWhatTheyLeadTo(t *testing.T) {
 	if !sameColour(hue(ActionStop), s.state[StateStopped]) {
 		t.Error("Stop is not the stopped hue")
 	}
-	for _, a := range []Action{ActionRetryFailed, ActionRecoverAccept, ActionRecoverRetry} {
+	for _, a := range []Action{ActionRetry} {
 		if !sameColour(hue(a), s.warn) {
 			t.Errorf("%v is not the warning hue", a)
 		}
@@ -122,7 +122,7 @@ func TestPaletteGlyphsTakeTheHueOfWhatTheyLeadTo(t *testing.T) {
 
 // The palette's own key hints use the same three-space gap as the footer's.
 func TestPaletteKeyHintsSitThreeSpacesApart(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	r.send(typeText(":")...)
 	if screen := r.screen(); !strings.Contains(screen, "↑↓ select   enter run   esc close") {
 		t.Fatalf("palette key hints:\n%s", screen)

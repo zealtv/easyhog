@@ -12,7 +12,7 @@ import (
 // as "ired, 0 paused)".
 func TestPaletteOverlayLeavesNoFragmentsBesideTheBox(t *testing.T) {
 	for _, size := range [][2]int{{100, 30}, {120, 40}, {80, 24}, {64, 20}} {
-		r := newRig(t, &fakeRunners{})
+		r := newRig(t, &fakeControl{})
 		r.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
 		r.send(typeText(":pl")...)
 		lines := strings.Split(r.screen(), "\n")
@@ -46,7 +46,7 @@ func TestPaletteOverlayLeavesNoFragmentsBesideTheBox(t *testing.T) {
 // "inspect only" although Run and Stop exist. It now says what is true
 // whatever the instance: nothing runs until the reader chooses it.
 func TestQuietStatusLineNoLongerSaysInspectOnly(t *testing.T) {
-	r := newRig(t, &fakeRunners{})
+	r := newRig(t, &fakeControl{})
 	screen := r.screen()
 	if strings.Contains(screen, "inspect only") {
 		t.Fatalf("stale footer text:\n%s", screen)

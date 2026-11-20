@@ -6,14 +6,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,8 +27,8 @@ import (
 )
 
 const (
-	pinnedRel    = "../groundhog/testdata/upstream-1c68c9d/groundhog.sh"
-	pinnedSHA256 = "298c9d5d11465607796043d44c5e8dc42a20912aa52c00988505aaf8be09dbb9"
+	pinnedRel    = "../groundhog/testdata/upstream-9317d4e/groundhog.sh"
+	pinnedSHA256 = "5a961d101ffc6d9186b836bd1f140c4c78e0b92770d682858a5a799d0cc562c2"
 	overdue      = "once/2020-01-01" // a date long gone: fires at the next enabled tick
 	future       = "once/2099-01-01"
 )
@@ -67,75 +65,24 @@ func repoFile(t *testing.T, rel ...string) string {
 	return abs
 }
 
-// tracker starts real runners and records every start, so the test can count
-// runner processes per instance and make sure none outlives it.
-type tracker struct {
-	mu     sync.Mutex
-	starts map[string]int // instance directory -> runner starts
-	kids   []runner.Child
-}
-
-func (l *tracker) Start(ln runner.Launch) (runner.Child, error) {
-	c, err := runner.Spawner{}.Start(ln)
-	if err != nil {
-		return nil, err
-	}
-	l.mu.Lock()
-	if l.starts == nil {
-		l.starts = map[string]int{}
-	}
-	l.starts[filepath.Dir(ln.Executable)]++
-	l.kids = append(l.kids, c)
-	l.mu.Unlock()
-	return c, nil
-}
-
-func (l *tracker) startsFor(inst string) int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.starts[inst]
-}
-
-func (l *tracker) reapAll(t *testing.T) {
-	l.mu.Lock()
-	kids := append([]runner.Child(nil), l.kids...)
-	l.mu.Unlock()
-	for _, c := range kids {
-		_ = c.Terminate()
-		select {
-		case <-c.Done():
-		case <-time.After(15 * time.Second):
-			t.Errorf("runner %d outlived the test", c.PID())
-		}
-	}
-}
-
-// world is one temporary root of synthetic repositories, an Easyhog session
-// (supervisor, refresher, model) and a second supervisor standing for another
-// owner of some instances.
+// world is one temporary root of synthetic repositories and an Easyhog session
+// (ticker, refresher, model).
 type world struct {
 	t      *testing.T
 	script []byte
 	tmp    string // short, canonical; holds everything the test writes
 	root   string // the directory Easyhog is pointed at
-	state  string // Easyhog's session directory base
 
-	easy, other *tracker
-	sup, osup   *core.Supervisor
-	ref         *core.Refresher
+	tk  *core.Ticker
+	ref *core.Refresher
 
 	m             tui.Model
 	ctx           context.Context
 	stopRefresher func()
-	backlog       int // pending deliveries on bravo when it was paused
-	// quitWait, when set, replaces the supervisor's 30 s wait for a runner's
-	// call at Quit, so a test can have a Quit that gives up waiting.
-	quitWait time.Duration
 }
 
 func newWorld(t *testing.T, script []byte) *world {
 	t.Helper()
-	// A short base keeps any unix socket path under the platform limit.
 	tmp, err := os.MkdirTemp("", "ehacc")
 	if err != nil {
 		t.Fatal(err)
@@ -144,74 +91,49 @@ func newWorld(t *testing.T, script []byte) *world {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(tmp) })
-	w := &world{t: t, script: script, tmp: tmp, root: filepath.Join(tmp, "repos"), state: filepath.Join(tmp, "state"),
-		easy: &tracker{}, other: &tracker{}, ctx: context.Background()}
-	for _, d := range []string{w.root, w.state} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
+	w := &world{t: t, script: script, tmp: tmp, root: filepath.Join(tmp, "repos"), ctx: context.Background()}
+	w.must(os.MkdirAll(w.root, 0o755))
 	return w
 }
 
-// start opens the first Easyhog session and the second supervisor, once the
-// repositories exist. Intervals are short so the reader's waits are seconds,
-// not minutes; nothing else differs from cmd/easyhog.
+// start opens the Easyhog session once the repositories exist.
 func (w *world) start() {
-	t := w.t
-	var err error
-	if w.osup, err = core.NewSupervisor(w.supervisorConfig(w.other, "other-state", "another-supervisor")); err != nil {
-		t.Fatal(err)
-	}
 	w.openSession()
-	t.Cleanup(func() {
-		qctx, qcancel := context.WithTimeout(context.Background(), 90*time.Second)
-		defer qcancel()
-		w.sup.Quit(qctx)
-		w.osup.Quit(qctx)
+	w.t.Cleanup(func() {
+		w.tk.Quit(context.Background())
 		w.closeSession()
-		w.easy.reapAll(t)
-		w.other.reapAll(t)
 	})
 }
 
-func (w *world) supervisorConfig(l runner.Launcher, dir, label string) core.SupervisorConfig {
-	return core.SupervisorConfig{Exec: runner.Process{}, Launcher: l, StateDir: filepath.Join(w.tmp, dir), Label: label,
-		RunInterval: time.Second, PollEvery: 100 * time.Millisecond, BusyDelay: 150 * time.Millisecond, StartWait: 15 * time.Second,
-		QuitWait: w.quitWait}
-}
-
-// openSession is what cmd/easyhog builds at launch: a supervisor that touches
-// nothing until Run, a refresher that runs scripts only for the selected
-// instance or on Refresh, and the shell reading one through the other. It can
-// be called again after Quit to stand for reopening Easyhog.
+// openSession is what cmd/easyhog builds at launch: a ticker that ticks only
+// what the reader runs, a refresher that runs scripts only for the selected
+// instance or on Refresh, and the shell reading one through the other. The
+// ticker ticks every second here, not every minute, so the reader's waits are
+// seconds; nothing else differs from cmd/easyhog. It can be called again after
+// Quit to stand for reopening Easyhog.
 func (w *world) openSession() {
 	t := w.t
 	var err error
 	clients := core.NewClients(runner.Process{}) // shared, as in cmd/easyhog
-	cfg := w.supervisorConfig(w.easy, "easy-state", "easyhog-acceptance")
-	cfg.Clients = clients
-	if w.sup, err = core.NewSupervisor(cfg); err != nil {
+	if w.tk, err = core.NewTicker(core.TickerConfig{Clients: clients, Interval: time.Second}); err != nil {
 		t.Fatal(err)
 	}
 	// The interval is far above one `status` call (the pinned script takes
 	// well under a second), or the selected instance would read as stale.
 	if w.ref, err = core.NewRefresher(core.Config{Root: w.root, FS: discovery.OS{}, Exec: runner.Process{}, Clients: clients,
-		IsOurs: w.sup.IsOurs, OnCoherent: w.sup.Observe,
 		Interval: 2 * time.Second, SelectSettle: 20 * time.Millisecond, DiscoverEvery: time.Hour}); err != nil {
 		t.Fatal(err)
 	}
 	if err := w.ref.Rescan(w.ctx); err != nil {
 		t.Fatal(err)
 	}
-	w.sup.Adopt(w.inRoot) // cmd/easyhog adopts the tokens of ended sessions before the first frame
 	ctx, cancel := context.WithCancel(w.ctx)
 	done := make(chan struct{})
 	go func() { defer close(done); _ = w.ref.Run(ctx) }()
 	w.stopRefresher = func() { cancel(); <-done }
 	w.m = tui.NewWithData(w.data(), tui.WithSelectionObserver(w.ref.Select), tui.WithRefresh(w.ref.Refresh),
 		tui.WithFolderOpener(func(string) error { return nil }), tui.WithPayloads(readPayload),
-		tui.WithRunners(w.sup, w.ref.Reinspect),
+		tui.WithControl(w.tk, w.ref.Reinspect),
 		// send runs each command to completion, so a self-re-arming clock tick
 		// would never let one finish; the world feeds time through sync instead.
 		tui.WithoutClockTicks())
@@ -227,7 +149,7 @@ func (w *world) closeSession() {
 	}
 }
 
-func (w *world) data() tui.Data { return tui.FromViewWith(w.ref.View(), w.sup.Runner) }
+func (w *world) data() tui.Data { return tui.FromViewWith(w.ref.View(), w.tk.Info) }
 
 // --- the synthetic repositories ------------------------------------------------------------
 
@@ -269,20 +191,18 @@ func (w *world) item(inst, when, id, note string) {
 	w.must(os.WriteFile(filepath.Join(inst, "schedule", when, id, "note.txt"), []byte(note+"\n"), 0o644))
 }
 
-// consumer writes runtime/config.json for an ordinary executable. cwd is the
-// repository holding .groundhog/.
-func (w *world) consumer(inst string, env map[string]string, argv ...string) {
+// run gives the item an executable run with this text: what firing it does.
+func (w *world) run(inst, when, id, text string) {
 	w.t.Helper()
-	var quoted, pairs []string
-	for _, a := range argv {
-		quoted = append(quoted, fmt.Sprintf("%q", a))
-	}
-	for k, v := range env {
-		pairs = append(pairs, fmt.Sprintf("%q:%q", k, v))
-	}
-	cfg := fmt.Sprintf(`{"schema_version":1,"consumer":{"argv":[%s],"cwd":"..","env":{%s}}}`+"\n",
-		strings.Join(quoted, ","), strings.Join(pairs, ","))
-	w.must(os.WriteFile(filepath.Join(inst, "runtime", "config.json"), []byte(cfg), 0o644))
+	w.must(os.WriteFile(filepath.Join(inst, "schedule", when, id, "run"), []byte(text), 0o755))
+}
+
+// example is one of the repository's examples/runs scripts, as text.
+func (w *world) example(name string) string {
+	w.t.Helper()
+	b, err := os.ReadFile(repoFile(w.t, "examples", "runs", name))
+	w.must(err)
+	return string(b)
 }
 
 func (w *world) client(inst string) *groundhog.Client {
@@ -318,36 +238,6 @@ func countState(st groundhog.Status, s groundhog.DeliveryState) int {
 	n := 0
 	for _, d := range st.Deliveries {
 		if d.State == s {
-			n++
-		}
-	}
-	return n
-}
-
-// runnerProcesses counts live `run` processes of one instance by its script
-// path. A bash subshell (a command substitution inside a tick) shows the same
-// command line as its parent for a moment, so a match whose parent also
-// matches is not counted again.
-func runnerProcesses(t *testing.T, inst string) int {
-	t.Helper()
-	out, err := exec.Command("ps", "-axo", "pid=,ppid=,command=").Output()
-	if err != nil {
-		t.Skipf("ps is not available: %v", err)
-	}
-	needle := filepath.Join(inst, "groundhog.sh") + " run "
-	matched := map[string]bool{}
-	var parents []string
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 3 || !strings.Contains(line, needle) {
-			continue
-		}
-		matched[f[0]] = true
-		parents = append(parents, f[1])
-	}
-	n := 0
-	for _, ppid := range parents {
-		if !matched[ppid] {
 			n++
 		}
 	}
@@ -540,15 +430,41 @@ func (w *world) selectInstance(rel string) {
 }
 
 // palette types a command into the palette and presses Enter. The result shows
-// in the status line.
+// in the status line. It feeds the model the refresher's current view first, as
+// RunLive's feed has done by the time a reader's keys arrive: the palette offers
+// what the model last saw, so a read that landed after the last sync (a step
+// checks the row through w.node, which reads the refresher) would otherwise
+// leave Run unoffered, Enter on "nothing matches" would do nothing, and the
+// status line would stay blank.
 func (w *world) palette(command string) (quit bool) {
+	w.t.Helper()
+	w.sync()
+	return w.paletteAsSeen(command)
+}
+
+// paletteAsSeen is palette on what the model shows now, without feeding it the
+// refresher's newer view first: a reader acting before the screen caught up.
+func (w *world) paletteAsSeen(command string) (quit bool) {
 	w.t.Helper()
 	w.send(typed(":" + command)...)
 	return w.send(press(tea.KeyEnter))
 }
 
+// said reports whether the screen says text: on one line (the status line, a
+// row), or in the preview pane, where a long phrase may wrap (an action's whole
+// outcome stays there as "Last action: …").
+func (w *world) said(text string) bool {
+	w.t.Helper()
+	for _, line := range strings.Split(w.screen(), "\n") {
+		if strings.Contains(strings.Join(strings.Fields(line), " "), text) {
+			return true
+		}
+	}
+	return strings.Contains(w.flat(), text)
+}
+
 // reread asks for a fresh status of one instance and waits for one the script
-// observed after the ask, as the reader's Run and Stop do. It makes the view
+// observed after the ask, as the reader's actions do. It makes the view
 // catch up with the protocol without waiting for the interval. A read that was
 // already under way when reread was called can finish after it and still show
 // the state from before, so such a read doesn't count: reread asks again. The
@@ -589,12 +505,13 @@ func (w *world) await(what string, limit time.Duration, cond func() bool) {
 }
 
 // offers reports whether the palette, opened on the current selection and
-// searched for name ("run" or "stop"), lists that command. It closes the palette
+// searched for name ("run", "stop", "retry"), lists that command. It closes the palette
 // again. It looks for the command's own row: Open folder keeps its aliases and
 // fuzzy matching, so a query like "stop" finds it too (scattered letters of
 // "files directory explorer"), and "nothing matches" would never show.
 func (w *world) offers(name string) bool {
 	w.t.Helper()
+	w.sync() // as palette does
 	w.send(typed(":" + name)...)
 	row := regexp.MustCompile(`│\s+(?:❯\s+)?\S\s+` + regexp.QuoteMeta(strings.ToUpper(name[:1])+name[1:]) + `\s+(?:.*)│`)
 	found := row.MatchString(w.screen())
@@ -602,10 +519,8 @@ func (w *world) offers(name string) bool {
 	return found
 }
 
-// readPayload is cmd/easyhog's: the item's files as bounded text, nothing run.
+// readPayload is cmd/easyhog's: the item's files and its newest runs' logs as
+// bounded text, nothing run.
 func readPayload(ref tui.PayloadRef) string {
-	return payload.Preview(payload.OS{}, ref.Instance, ref.Rel)
+	return payload.ItemPreview(payload.OS{}, ref.Instance, ref.Rel, ref.Logs)
 }
-
-// inRoot is the scope cmd/easyhog gives Adopt: instances beneath the root.
-func (w *world) inRoot(instance string) bool { return core.Within(w.root, instance) }

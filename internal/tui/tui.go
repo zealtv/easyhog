@@ -59,13 +59,13 @@ type Model struct {
 
 	readPayload func(PayloadRef) string
 	openFolder  func(dir string) error
-	runners     Runners
+	control     Control
 	reread      func(instanceKey string)
 	payload     payloadState
-	// busy holds the Run, Stop or settling action under way for each instance key. It is
+	// busy holds the action under way for each instance key (Run, Stop, Retry, a pause). It is
 	// replaced, never edited, since a Model is copied by value.
 	busy map[string]working
-	// last is the newest Run, Stop or settling outcome, kept whole for the preview of
+	// last is the newest such action's outcome, kept whole for the preview of
 	// its instance: the status line holds one line and can cut a long reason.
 	last *outcome
 	// clock is where "now" comes from (WithClock); now is its reading at the
@@ -78,14 +78,14 @@ type Model struct {
 	noTicks bool
 }
 
-// outcome is a finished Run, Stop or settling action: whose, and the notice that was shown.
+// outcome is a finished action on an instance: whose, and the notice that was shown.
 type outcome struct {
 	instance string
 	text     string
 	failure  bool
 }
 
-// working is a Run, Stop or settling action the supervisor has not yet answered.
+// working is an action on an instance the ticker has not yet answered.
 type working struct {
 	action Action
 	label  string
@@ -176,8 +176,8 @@ func NewWithData(data Data, opts ...Option) Model {
 			}
 		}
 	}
-	if m.runners != nil {
-		m.handler = runnersHandler(m.handler, m.runners, m.reread)
+	if m.control != nil {
+		m.handler = controlHandler(m.handler, m.control, m.reread)
 	}
 	m.now = m.clockNow()
 	m = m.load(data)
@@ -502,10 +502,12 @@ func (w working) verb() string {
 	switch w.action {
 	case ActionStop:
 		return "Stopping"
-	case ActionRetryFailed:
+	case ActionRetry:
 		return "Retrying"
-	case ActionRecoverAccept, ActionRecoverRetry:
-		return "Recovering"
+	case ActionPause:
+		return "Pausing"
+	case ActionUnpause:
+		return "Unpausing"
 	case ActionPauseItem:
 		return "Pausing"
 	case ActionUnpauseItem:

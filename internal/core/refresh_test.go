@@ -32,7 +32,7 @@ func (g *rig) tick() {
 func status(g *rig, inst string) int { return g.exec.count(inst, "status") }
 
 func TestOnlyTheSelectedInstanceRuns(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a, b, c := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b"), mkInstance(t, g.root, "c")
 	g.start()
 	if g.exec.total() != 0 {
@@ -59,7 +59,7 @@ func TestOnlyTheSelectedInstanceRuns(t *testing.T) {
 			t.Errorf("%s: class %v health %v, want not inspected", key, iv.Class, iv.Health)
 		}
 	}
-	if iv, _ := v.Find(a); !iv.Selected || iv.Class != ClassUnowned || iv.Health != HealthOK {
+	if iv, _ := v.Find(a); !iv.Selected || iv.Class != ClassSupported || iv.Health != HealthOK {
 		t.Errorf("a: selected=%v class=%v health=%v", iv.Selected, iv.Class, iv.Health)
 	}
 	// Capabilities were negotiated once, not on every poll.
@@ -69,7 +69,7 @@ func TestOnlyTheSelectedInstanceRuns(t *testing.T) {
 }
 
 func TestSelectionRunsNothingUntilItSettles(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a, b, c := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b"), mkInstance(t, g.root, "c")
 	g.start()
 
@@ -89,7 +89,7 @@ func TestSelectionRunsNothingUntilItSettles(t *testing.T) {
 }
 
 func TestExplicitRefreshRunsEveryWellFormedInstance(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a, b, c := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b"), mkInstance(t, g.root, "c")
 	bad := filepath.Join(g.root, "bad", ".groundhog") // no groundhog.sh: malformed
 	for _, d := range []string{"schedule", "out", "fired"} {
@@ -131,7 +131,7 @@ func TestExplicitRefreshBoundsConcurrency(t *testing.T) {
 			time.Sleep(15 * time.Millisecond)
 			cur.Add(-1)
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, func(c *Config) { c.Concurrency = 3 })
 	for i := 0; i < 12; i++ {
@@ -160,7 +160,7 @@ func TestOneHungInstanceDoesNotStallTheOthers(t *testing.T) {
 			<-ctx.Done()
 			return "", ctx.Err()
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, func(c *Config) { c.CallTimeout = 300 * time.Millisecond })
 	hung = mkInstance(t, g.root, "a-hung")
@@ -201,7 +201,7 @@ func TestFailureKeepsTheLastGoodSnapshotAndBacksOff(t *testing.T) {
 		if cmd == "status" && (n == 2 || n == 3) {
 			return "", exitStatus(5)
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -223,7 +223,7 @@ func TestFailureKeepsTheLastGoodSnapshotAndBacksOff(t *testing.T) {
 	if iv.Inspection.Last == nil || !iv.Inspection.Last.TakenAt.Equal(firstAt) {
 		t.Fatalf("the last good snapshot was not kept: %+v", iv.Inspection)
 	}
-	if iv.Class != ClassUnowned {
+	if iv.Class != ClassSupported {
 		t.Errorf("class %v; a failure should not erase what the instance is", iv.Class)
 	}
 	if !iv.Inspection.ErrAt.After(firstAt) {
@@ -258,7 +258,7 @@ func TestCancellationStopsCallsInFlight(t *testing.T) {
 			cancelled <- inst
 			return "", ctx.Err()
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, func(c *Config) { c.CallTimeout = time.Minute })
 	a, b := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b")
@@ -291,7 +291,7 @@ func TestCancellationStopsCallsInFlight(t *testing.T) {
 }
 
 func TestSelectionSurvivesAdditionsRemovalsAndReordering(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	mkInstance(t, g.root, "m")
 	b := mkInstance(t, g.root, "m2")
 	g.start()
@@ -345,88 +345,19 @@ func TestSelectionSurvivesAdditionsRemovalsAndReordering(t *testing.T) {
 	}
 }
 
-func TestInconsistentStatusIsRetriedThenKeptVisibly(t *testing.T) {
-	cases := []struct {
-		name   string
-		opts   func(n int) statusOpts
-		reads  int
-		health Health
-	}{
-		{"inconsistent until the end", func(int) statusOpts { return statusOpts{rev: 3, inconsist: true} }, 3, HealthInconsistent},
-		{"settles on the second read", func(n int) statusOpts { return statusOpts{rev: 3, inconsist: n < 2} }, 2, HealthOK},
-		// The script reports a write in progress as consistent:false; the
-		// journal generation is for display, and an odd one alone is trusted
-		// as the script said it.
-		{"an odd journal generation on a consistent status is not retried", func(int) statusOpts { return statusOpts{rev: 3, gen: 5} }, 1, HealthOK},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			fn := func(ctx context.Context, inst, cmd string, n int) (string, error) {
-				if cmd == "status" {
-					return statusJSON(inst, tc.opts(n)), nil
-				}
-				return healthy(1)(ctx, inst, cmd, n)
-			}
-			g := newRig(t, fn, func(c *Config) { c.Interval = time.Hour })
-			a := mkInstance(t, g.root, "a")
-			g.start()
-			g.r.Select(a)
-			eventually(t, "settle timer", func() bool { return g.clk.pending() >= 3 })
-			g.clk.Advance(g.r.Config().SelectSettle)
-			for i := 1; i < tc.reads; i++ {
-				want := i
-				eventually(t, "a read", func() bool { return status(g, a) == want })
-				eventually(t, "the retry timer", func() bool { return g.clk.pending() >= 3 })
-				g.clk.Advance(g.r.Config().RetryDelay)
-			}
-			eventually(t, "the result", func() bool { iv, _ := g.view().Find(a); return iv.Inspection.Last != nil })
-			iv, _ := g.view().Find(a)
-			if iv.Health != tc.health || iv.Inspection.Attempts != tc.reads {
-				t.Fatalf("health=%v attempts=%d; want %v/%d", iv.Health, iv.Inspection.Attempts, tc.health, tc.reads)
-			}
-			never(t, "a read beyond the bound", func() bool { return status(g, a) > tc.reads })
-		})
-	}
-}
-
-func TestInconsistentReadReplacesTheSnapshotAndIsMarked(t *testing.T) {
-	fn := func(ctx context.Context, inst, cmd string, n int) (string, error) {
-		if cmd == "status" {
-			return statusJSON(inst, statusOpts{rev: int64(n), inconsist: n > 1}), nil
-		}
-		return healthy(1)(ctx, inst, cmd, n)
-	}
-	g := newRig(t, fn, func(c *Config) { c.Retries = -1 })
-	a := mkInstance(t, g.root, "a")
-	g.start()
-	g.r.Select(a)
-	eventually(t, "settle timer", func() bool { return g.clk.pending() >= 3 })
-	g.clk.Advance(g.r.Config().SelectSettle)
-	eventually(t, "first read", func() bool { iv, _ := g.view().Find(a); return readOK(iv) })
-	g.tick()
-	eventually(t, "inconsistent read", func() bool { iv, _ := g.view().Find(a); return iv.Health == HealthInconsistent })
-	iv, _ := g.view().Find(a)
-	if iv.Inspection.Last == nil || iv.Inspection.Last.Status.Revision != 2 || iv.Inspection.Last.Status.Consistent {
-		t.Fatalf("last %+v; want the newest read, inconsistent", iv.Inspection.Last)
-	}
-}
-
-// What status shows can move while the revision, the journal generation and
-// the listings hold still (a runner killed by a signal reads as unknown;
-// eligibility follows the clock). The view must follow the newest read, and a
-// poll must still skip the capabilities call. Each step waits on what the view
-// holds, never on a signal: the poll that starts a read also signals the
-// selected instance's age at once, before that read is recorded.
+// What status shows can move while the listings hold still (a run ends; the
+// pause is set by another tool; eligibility follows the clock). The view must
+// follow the newest read, and a poll must still skip the capabilities call.
+// Each step waits on what the view holds, never on a signal: the poll that
+// starts a read also signals the selected instance's age at once, before that
+// read is recorded.
 func TestChangedReadsReachTheView(t *testing.T) {
-	var eligible atomic.Bool
-	var runnerState atomic.Value
-	runnerState.Store("running")
+	var eligible, paused atomic.Bool
 	fn := func(ctx context.Context, inst, cmd string, n int) (string, error) {
 		if cmd == "status" {
-			return statusJSON(inst, statusOpts{rev: 7, gen: 4, itemPath: "schedule/daily/x",
-				eligible: eligible.Load(), runner: runnerState.Load().(string)}), nil
+			return statusJSON(inst, statusOpts{itemPath: "schedule/daily/x", eligible: eligible.Load(), paused: paused.Load()}), nil
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -434,17 +365,17 @@ func TestChangedReadsReachTheView(t *testing.T) {
 	g.r.Select(a)
 	eventually(t, "settle timer", func() bool { return g.clk.pending() >= 3 })
 	g.clk.Advance(g.r.Config().SelectSettle)
-	eventually(t, "the first read to show a running runner", func() bool {
+	eventually(t, "the first read", func() bool {
 		iv, _ := g.view().Find(a)
-		return iv.Inspection.Last != nil && iv.Inspection.Last.Status.Runner.State == groundhog.RunnerRunning
+		return iv.Inspection.Last != nil && !iv.Inspection.Last.Status.Paused
 	})
 
-	// Only the runner state moved: running to unknown.
-	runnerState.Store("unknown")
+	// Only the pause moved.
+	paused.Store(true)
 	g.tick()
-	eventually(t, "the view to show the runner unknown", func() bool {
+	eventually(t, "the view to show the pause", func() bool {
 		iv, _ := g.view().Find(a)
-		return iv.Inspection.Last.Status.Runner.State == groundhog.RunnerUnknown
+		return iv.Inspection.Last.Status.Paused
 	})
 
 	// Only clock-dependent eligibility moved.
@@ -474,7 +405,7 @@ func TestEveryCompletedReadIsAnnounced(t *testing.T) {
 			case <-ctx.Done():
 			}
 		}
-		return healthy(7)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -510,7 +441,7 @@ func TestSelectedAgeIsAnnouncedEachInterval(t *testing.T) {
 			<-ctx.Done() // a status read that never returns
 			return "", ctx.Err()
 		}
-		return healthy(7)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -533,9 +464,9 @@ func TestSelectedAgeIsAnnouncedEachInterval(t *testing.T) {
 func TestChangedListingsReachTheView(t *testing.T) {
 	fn := func(ctx context.Context, inst, cmd string, n int) (string, error) {
 		if cmd == "status" {
-			return statusJSON(inst, statusOpts{rev: 7, gen: 4}), nil
+			return statusJSON(inst, statusOpts{}), nil
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -561,21 +492,17 @@ func TestClassesAreDistinguished(t *testing.T) {
 		switch {
 		case name == "legacy" && cmd == "capabilities":
 			return "", exitStatus(1)
+		case name == "older" && cmd == "capabilities":
+			return `{"protocol":"groundhog-runtime","protocol_version":1,"capabilities":["status-json-v1","ownership-v1"]}`, nil
 		case name == "partial" && cmd == "capabilities":
-			return capsJSON("status-json-v1"), nil
+			return capsJSON("status-json-v2", "pause-v2"), nil
 		case name == "broken" && cmd == "status":
 			return "", exitStatus(6)
-		case name == "external" && cmd == "status":
-			return statusJSON(inst, statusOpts{rev: 1, owner: "other-supervisor"}), nil
-		case name == "mine" && cmd == "status":
-			return statusJSON(inst, statusOpts{rev: 1, owner: "me"}), nil
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
-	g := newRig(t, fn, func(c *Config) {
-		c.IsOurs = func(o groundhog.Owner) bool { return o.ID == "me" }
-	})
-	for _, n := range []string{"legacy", "partial", "broken", "external", "mine", "plain"} {
+	g := newRig(t, fn, nil)
+	for _, n := range []string{"legacy", "older", "partial", "broken", "plain"} {
 		mkInstance(t, g.root, n)
 	}
 	g.start()
@@ -586,17 +513,22 @@ func TestClassesAreDistinguished(t *testing.T) {
 				return false
 			}
 		}
-		return len(g.view().Instances) == 6
+		return len(g.view().Instances) == 5
 	})
-	want := map[string]Class{"legacy": ClassLegacy, "partial": ClassUnsupported, "broken": ClassFailing,
-		"external": ClassExternal, "mine": ClassOwnedBySession, "plain": ClassUnowned}
+	want := map[string]Class{"legacy": ClassLegacy, "older": ClassLegacy, "partial": ClassUnsupported, "broken": ClassFailing,
+		"plain": ClassSupported}
 	for name, class := range want {
 		if iv := g.inst(g.view(), name); iv.Class != class {
 			t.Errorf("%s: class %v, want %v", name, iv.Class, class)
 		}
 	}
-	if legacy := g.inst(g.view(), "legacy"); status(g, legacy.Instance.Path) != 0 {
-		t.Error("a legacy script was asked for status")
+	for _, name := range []string{"legacy", "older"} {
+		if iv := g.inst(g.view(), name); status(g, iv.Instance.Path) != 0 {
+			t.Errorf("%s: a script that is not protocol 2 was asked for status", name)
+		}
+	}
+	if r := g.inst(g.view(), "older").Inspection.Support.Reason; !strings.Contains(r, "older Groundhog") {
+		t.Errorf("older: reason %q", r)
 	}
 	if !g.inst(g.view(), "broken").Failing() {
 		t.Error("broken should be failing")
@@ -606,13 +538,13 @@ func TestClassesAreDistinguished(t *testing.T) {
 	for _, c := range want {
 		seen[c.String()] = true
 	}
-	if len(seen) != len(want) {
+	if len(seen) != len(want)-1 { // legacy twice
 		t.Errorf("class names collide: %v", seen)
 	}
 }
 
 func TestAChangedScriptIsNegotiatedAgain(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a := mkInstance(t, g.root, "a")
 	g.start()
 	g.r.Select(a)
@@ -632,7 +564,7 @@ func TestAChangedScriptIsNegotiatedAgain(t *testing.T) {
 }
 
 func TestPeriodicRescanFindsAdditionsWithoutRunningThem(t *testing.T) {
-	g := newRig(t, healthy(1), func(c *Config) { c.DiscoverEvery = time.Minute })
+	g := newRig(t, healthy(), func(c *Config) { c.DiscoverEvery = time.Minute })
 	mkInstance(t, g.root, "a")
 	g.start()
 	added := mkInstance(t, g.root, "b")
@@ -648,7 +580,7 @@ func TestPeriodicRescanFindsAdditionsWithoutRunningThem(t *testing.T) {
 }
 
 func TestFailedRescanKeepsThePreviousListAndSaysSo(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a := mkInstance(t, g.root, "a")
 	g.start()
 	if err := os.RemoveAll(g.root); err != nil {
@@ -684,7 +616,7 @@ func TestExplicitRefreshDuringAReadRerunsOnce(t *testing.T) {
 				return "", ctx.Err()
 			}
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -704,14 +636,14 @@ func TestExplicitRefreshDuringAReadRerunsOnce(t *testing.T) {
 // After an action the terminal asks for one instance to be read at once. It
 // reaches that instance's script only, not the others, and not on any timer.
 func TestReinspectReadsOnlyThatInstanceNow(t *testing.T) {
-	g := newRig(t, healthy(1), nil)
+	g := newRig(t, healthy(), nil)
 	a, b := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b")
 	g.start()
 
 	g.r.Reinspect(b)
 	eventually(t, "b read without waiting for the interval", func() bool { return status(g, b) == 1 })
 	never(t, "any read of a", func() bool { return status(g, a) != 0 })
-	if iv, _ := g.view().Find(b); iv.Class != ClassUnowned || iv.Inspection.Last == nil {
+	if iv, _ := g.view().Find(b); iv.Class != ClassSupported || iv.Inspection.Last == nil {
 		t.Errorf("b after Reinspect: class %v last %v", iv.Class, iv.Inspection.Last)
 	}
 
@@ -738,7 +670,7 @@ func TestReinspectDuringAReadRerunsOnce(t *testing.T) {
 				return "", ctx.Err()
 			}
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}
 	g := newRig(t, fn, nil)
 	a := mkInstance(t, g.root, "a")
@@ -764,7 +696,7 @@ func TestSelectingAnOldReadIsNotStaleUntilItHasHadItsTurn(t *testing.T) {
 			<-ctx.Done() // a's later reads never answer
 			return "", ctx.Err()
 		}
-		return healthy(1)(ctx, inst, cmd, n)
+		return healthy()(ctx, inst, cmd, n)
 	}, nil)
 	a, b := mkInstance(t, g.root, "a"), mkInstance(t, g.root, "b")
 	g.start()
@@ -835,17 +767,17 @@ func (a *argsExec) statusArgs() []string {
 	return out
 }
 
-// The refresher reads status through the shared client, which passes --active
-// to a script that offers status-active-v1 and nothing to one that does not:
-// one place decides, and the refresher does not.
-func TestTheRefresherPassesActiveOnlyToAScriptThatOffersIt(t *testing.T) {
+// The refresher reads status through the shared client, which passes
+// --next-due to a script that offers next-due-v1 and nothing to one that does
+// not: one place decides, and the refresher does not.
+func TestTheRefresherPassesNextDueOnlyToAScriptThatOffersIt(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		caps []string
 		want string
 	}{
-		{"offered", append(controlCaps(), "status-active-v1"), "status --json --active"},
-		{"not offered", controlCaps(), "status --json"},
+		{"offered", controlCaps(), "status --json --next-due"},
+		{"not offered", []string{"status-json-v2", "pause-v2", "handlers-v1"}, "status --json"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fn := func(_ context.Context, inst, cmd string, _ int) (string, error) {
@@ -853,7 +785,7 @@ func TestTheRefresherPassesActiveOnlyToAScriptThatOffersIt(t *testing.T) {
 				case "capabilities":
 					return capsJSON(tc.caps...), nil
 				case "status":
-					return statusJSON(inst, statusOpts{rev: 1}), nil
+					return statusJSON(inst, statusOpts{}), nil
 				}
 				return "", exitStatus(1)
 			}

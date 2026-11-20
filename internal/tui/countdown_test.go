@@ -256,7 +256,7 @@ func TestScrollingASecondsRowIntoViewSpeedsTheClockUp(t *testing.T) {
 
 // The preview keeps the exact local date and time, and says when the item fires.
 func TestPreviewKeepsTheExactNextDue(t *testing.T) {
-	v := withDeliveries(unowned("a"))
+	v := withDeliveries(supported("a"))
 	st := v.Inspection.Last.Status
 	due := time.Date(2026, 11, 19, 9, 0, 0, 0, time.UTC)
 	st.Schedule = []groundhog.ScheduleItem{{Path: "schedule/daily/x", ItemID: "x", Cadence: &groundhog.Cadence{Axis: "daily", Time: sp("09:00")},

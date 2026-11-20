@@ -39,12 +39,12 @@ func TestItemLabelsNameTheItemByItsFolder(t *testing.T) {
 
 func itemRows(t *testing.T, v core.InstanceView) []Node {
 	t.Helper()
-	return FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil)).Nodes[0].Children
+	return FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks()).Nodes[0].Children
 }
 
 func TestAnItemRowSaysTheNameOnceAndTheBadgeKeepsTheTiming(t *testing.T) {
 	const path = "schedule/once/2026-11-18/19-45/nightly-review-wake"
-	v := ours("a", groundhog.RunnerRunning, false)
+	v := supported("a")
 	st := v.Inspection.Last.Status
 	st.Schedule = []groundhog.ScheduleItem{{Path: path, ItemID: "nightly-review-wake",
 		Cadence: &groundhog.Cadence{Axis: "once", Date: sp("2026-11-18"), Time: sp("19:45")}}}
@@ -68,7 +68,7 @@ func TestAnItemRowSaysTheNameOnceAndTheBadgeKeepsTheTiming(t *testing.T) {
 		t.Errorf("badge %q lost the cadence", k.Badge)
 	}
 
-	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, lookup(nil))), tea.WindowSizeMsg{Width: 100, Height: 24},
+	m, _ := feed(NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks())), tea.WindowSizeMsg{Width: 100, Height: 24},
 		key(tea.KeyRight))
 	row := ansi.Strip(m.treeRow(1, 100))
 	if !strings.Contains(row, "nightly-review-wake") || strings.Contains(row, "2026-11-18/") || strings.Contains(row, "once/") {
@@ -77,7 +77,7 @@ func TestAnItemRowSaysTheNameOnceAndTheBadgeKeepsTheTiming(t *testing.T) {
 }
 
 func TestItemsWithOneNameStayApartInTheTree(t *testing.T) {
-	v := ours("a", groundhog.RunnerRunning, false)
+	v := supported("a")
 	st := v.Inspection.Last.Status
 	st.Schedule = []groundhog.ScheduleItem{
 		{Path: "schedule/daily/report", ItemID: "report"},

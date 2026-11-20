@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +90,7 @@ type fakeExec struct {
 	fn     script
 	mu     sync.Mutex
 	calls  []call
+	argv   []string // each call's arguments, space-joined
 	counts map[call]int
 }
 
@@ -100,6 +102,7 @@ func (f *fakeExec) Run(ctx context.Context, inv runner.Invocation) error {
 	c := call{inv.Dir, inv.Args[0]}
 	f.mu.Lock()
 	f.calls = append(f.calls, c)
+	f.argv = append(f.argv, strings.Join(inv.Args, " "))
 	f.counts[c]++
 	n := f.counts[c]
 	f.mu.Unlock()
@@ -134,46 +137,64 @@ func (f *fakeExec) ran() []string {
 	return out
 }
 
+// args lists the argument strings of every call of cmd, in order.
+func (f *fakeExec) args(cmd string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []string
+	for _, a := range f.argv {
+		if a == cmd || strings.HasPrefix(a, cmd+" ") {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 func (f *fakeExec) total() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
 }
 
-// controlCaps lists the six capabilities a supervised script has to offer.
+// controlCaps lists what a script has to offer before Easyhog ticks it.
 func controlCaps() []string {
-	return []string{"status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1"}
+	return []string{"status-json-v2", "next-due-v1", "add-from-v1", "pause-v2", "handlers-v1"}
 }
 
 func capsJSON(caps ...string) string {
 	if caps == nil {
 		caps = controlCaps()
 	}
-	b, _ := json.Marshal(map[string]any{"protocol": "groundhog-runtime", "protocol_version": 1, "capabilities": caps})
+	b, _ := json.Marshal(map[string]any{"protocol": "groundhog-runtime", "protocol_version": 2, "capabilities": caps})
 	return string(b)
 }
 
 // statusOpts shapes a synthetic status document.
 type statusOpts struct {
-	rev, gen   int64
-	inconsist  bool
-	owner      string
+	paused     bool
 	eligible   bool
 	itemPath   string
 	observedAt string
-	runner     string // runner state; "stopped" when empty
+	lastTick   string // last_tick.at; none when empty
+	deliveries []any  // as fakeDelivery builds them
+}
+
+// fakeDelivery is one delivery record fired from item, in state.
+func fakeDelivery(name, item, state string) map[string]any {
+	return map[string]any{
+		"path": "out/" + name, "id": "d-" + name, "state": state, "fired_at": "2026-11-15T08:59:00Z",
+		"schedule_path": item, "occurrence": map[string]any{"date": "2026-11-15", "slot": nil},
+		"run": state != "delivered", "exit_status": nil, "attempts": []any{}, "log": nil,
+	}
 }
 
 func statusJSON(inst string, o statusOpts) string {
-	var owner any
-	if o.owner != "" {
-		owner = map[string]any{"id": o.owner, "generation": 1, "label": o.owner}
-	}
 	if o.observedAt == "" {
 		o.observedAt = "2026-11-15T09:00:00Z"
 	}
-	if o.runner == "" {
-		o.runner = "stopped"
+	var lastTick any
+	if o.lastTick != "" {
+		lastTick = map[string]any{"at": o.lastTick, "source": "standalone"}
 	}
 	sched := []any{}
 	if o.itemPath != "" {
@@ -183,26 +204,25 @@ func statusJSON(inst string, o statusOpts) string {
 			"firing_allowed": false, "blocked_by": []string{},
 		})
 	}
+	if o.deliveries == nil {
+		o.deliveries = []any{}
+	}
 	b, _ := json.Marshal(map[string]any{
-		"protocol": "groundhog-runtime", "protocol_version": 1, "instance": inst,
-		"observed_at": o.observedAt, "revision": o.rev, "journal_generation": o.gen,
-		"consistent": !o.inconsist, "paused": false, "owner": owner,
-		"runner":     map[string]any{"state": o.runner, "last_error": nil},
-		"consumer":   map[string]any{"configured": false, "valid": false},
-		"schedule":   sched,
-		"deliveries": []any{}, "diagnostics": []any{},
+		"protocol": "groundhog-runtime", "protocol_version": 2, "instance": inst,
+		"observed_at": o.observedAt, "paused": o.paused, "last_tick": lastTick,
+		"schedule": sched, "deliveries": o.deliveries, "diagnostics": []any{},
 	})
 	return string(b)
 }
 
-// healthy answers every instance with full capabilities and an unowned status.
-func healthy(rev int64) script {
+// healthy answers every instance with full capabilities and a plain status.
+func healthy() script {
 	return func(_ context.Context, inst, cmd string, _ int) (string, error) {
 		switch cmd {
 		case "capabilities":
 			return capsJSON(), nil
 		case "status":
-			return statusJSON(inst, statusOpts{rev: rev}), nil
+			return statusJSON(inst, statusOpts{}), nil
 		}
 		return "", exitStatus(1)
 	}
@@ -249,7 +269,7 @@ func newRig(t *testing.T, fn script, tune func(*Config)) *rig {
 	g := &rig{t: t, root: tempRoot(t), exec: newExec(fn), clk: newClock()}
 	cfg := Config{Root: g.root, FS: discovery.OS{}, Exec: g.exec, Clock: g.clk,
 		Interval: 5 * time.Second, SelectSettle: 500 * time.Millisecond, DiscoverEvery: time.Hour,
-		CallTimeout: 5 * time.Second, Concurrency: 4, RetryDelay: 300 * time.Millisecond}
+		CallTimeout: 5 * time.Second, Concurrency: 4}
 	if tune != nil {
 		tune(&cfg)
 	}

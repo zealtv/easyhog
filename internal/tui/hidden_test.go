@@ -218,7 +218,7 @@ func TestEmptyVisibleTreeSaysHowToShowHiddenInstances(t *testing.T) {
 func TestAdapterHidesByClassOnly(t *testing.T) {
 	hid := map[core.Class]bool{core.ClassMalformed: true, core.ClassLegacy: true, core.ClassUnsupported: true}
 	for _, c := range []core.Class{core.ClassNotInspected, core.ClassMalformed, core.ClassLegacy, core.ClassUnsupported,
-		core.ClassUnowned, core.ClassOwnedBySession, core.ClassExternal, core.ClassFailing} {
+		core.ClassSupported, core.ClassFailing} {
 		// A host-looking name must not matter, either way.
 		for _, name := range []string{"host", "app"} {
 			v := iv(name, c, core.HealthOK, core.Inspection{})

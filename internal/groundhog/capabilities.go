@@ -11,40 +11,30 @@ import (
 	"strings"
 )
 
-// Protocol identity and the one version this client reads.
+// Protocol identity and the one version this client reads. Protocol 1
+// (Groundhog before 9317d4e: owners, runners, a consumer) is shown read-only.
 const (
 	Protocol        = "groundhog-runtime"
-	ProtocolVersion = 1
+	ProtocolVersion = 2
 )
 
-// Capability names of protocol version 1.
+// Capability names of protocol version 2.
 const (
-	CapStatusJSON = "status-json-v1"
-	CapOwnership  = "ownership-v1"
-	CapRunner     = "runner-v1"
-	CapPause      = "pause-v1"
-	CapConsumer   = "consumer-v1"
-	CapDelivery   = "delivery-v1"
-)
-
-// Optional capabilities, found in `capabilities --json` before the client uses
-// what they name. A script without one stays fully supported; the client keeps
-// the older behaviour.
-const (
-	// CapStatusActive offers `status --json --active`: settled deliveries leave
-	// `deliveries` and a top-level `settled` object counts them.
-	CapStatusActive = "status-active-v1"
+	CapStatusJSON = "status-json-v2"
 	// CapNextDue offers `status --json --next-due`: each schedule record gains
 	// `next_due`, the UTC time its next unfired occurrence begins (or null).
 	CapNextDue = "next-due-v1"
-	// CapReleaseUnresolved offers `release --leave-unresolved`: release succeeds
-	// although an attempt is unresolved, and the barrier stays until `recover`.
-	CapReleaseUnresolved = "release-unresolved-v1"
+	// CapPause offers `pause` and `resume` with no token.
+	CapPause = "pause-v2"
+	// CapHandlers offers runs, the delivery record and `retry`. A host without a
+	// lock helper lacks it, and its ticks fire unlocked and start no run.
+	CapHandlers = "handlers-v1"
 )
 
-// ControlCapabilities are the six capabilities the contract requires, with
-// version 1, for supervised control.
-var ControlCapabilities = []string{CapStatusJSON, CapOwnership, CapRunner, CapPause, CapConsumer, CapDelivery}
+// ControlCapabilities are what Easyhog needs before it ticks an instance,
+// retries a delivery or pauses it: the status projection, the tokenless pause,
+// and runs that start once under Groundhog's locks.
+var ControlCapabilities = []string{CapStatusJSON, CapPause, CapHandlers}
 
 // Capabilities is the parsed answer of `capabilities --json`.
 type Capabilities struct {
@@ -111,9 +101,9 @@ func (c *Client) Capabilities(ctx context.Context, opts ...Option) (Capabilities
 
 // Support is the outcome of negotiation with one script.
 type Support struct {
-	// Controllable is true only for protocol version 1 with all six capabilities.
+	// Controllable is true only for protocol version 2 with ControlCapabilities.
 	Controllable bool
-	// Inspectable is true when `status --json` is advertised (version 1).
+	// Inspectable is true when `status --json` is advertised (version 2).
 	Inspectable bool
 	// Reason says why the script is not controllable; empty when it is.
 	Reason string
@@ -158,6 +148,9 @@ func (c *Client) Negotiate(ctx context.Context, opts ...Option) (Support, error)
 				ee.Code, stderrSuffix(ee.Stderr)), Missing: append([]string(nil), ControlCapabilities...)}
 		case errors.As(err, &me):
 			sup = Support{Reason: "`capabilities --json` output is malformed: " + strings.Join(me.Problems, "; "),
+				Missing: append([]string(nil), ControlCapabilities...)}
+		case errors.As(err, &pe) && pe.Protocol == Protocol && pe.Version == 1:
+			sup = Support{Reason: "the script is an older Groundhog (runtime protocol 1, before items carried their own run); Easyhog reads protocol 2, so it only shows this instance",
 				Missing: append([]string(nil), ControlCapabilities...)}
 		case errors.As(err, &pe):
 			sup = Support{Reason: fmt.Sprintf("the script speaks protocol %q version %d; this client reads %q version %d",

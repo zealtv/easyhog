@@ -16,7 +16,7 @@ func TestCapabilitiesParses(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Protocol != Protocol || got.ProtocolVersion != 1 || got.ImplementationVersion != "example-build" || !got.Has("delivery-v1") || !got.Has("telepathy-v9") || got.Has("nope") {
+	if got.Protocol != Protocol || got.ProtocolVersion != 2 || got.ImplementationVersion != "example-build" || !got.Has("handlers-v1") || !got.Has("telepathy-v9") || got.Has("nope") {
 		t.Errorf("%+v", got)
 	}
 	if inv := f.calls[0]; strings.Join(inv.Args, " ") != "capabilities --json" || inv.Executable != fakeInstance+"/groundhog.sh" {
@@ -35,7 +35,7 @@ func TestCapabilitiesStrict(t *testing.T) {
 			t.Errorf("without %s: %v", key, err)
 		}
 	}
-	for _, doc := range []string{"", "nope", "[]", good[:len(good)/2], good + good, `{"protocol":"groundhog-runtime","protocol_version":"1","capabilities":[]}`} {
+	for _, doc := range []string{"", "nope", "[]", good[:len(good)/2], good + good, `{"protocol":"groundhog-runtime","protocol_version":"2","capabilities":[]}`} {
 		f := newFake(t).on("capabilities", ok(doc))
 		if _, err := newClient(t, f).Capabilities(context.Background()); !errors.Is(err, ErrMalformed) {
 			t.Errorf("%.30q: %v", doc, err)
@@ -55,12 +55,16 @@ func TestNegotiate(t *testing.T) {
 		doc["capabilities"] = keep
 		return doc
 	}
-	version2 := fullCaps()
-	version2["protocol_version"] = 2
+	protocol1 := map[string]any{
+		"protocol": "groundhog-runtime", "protocol_version": 1,
+		"capabilities": []string{"status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1"},
+	}
+	version3 := fullCaps()
+	version3["protocol_version"] = 3
 	otherProtocol := fullCaps()
 	otherProtocol["protocol"] = "something-else"
-	statusOnly := fullCaps()
-	statusOnly["capabilities"] = []string{"status-json-v1"}
+	noLockHelper := fullCaps()
+	noLockHelper["capabilities"] = []string{"status-json-v2", "next-due-v1", "add-from-v1", "pause-v2"}
 
 	tests := []struct {
 		name         string
@@ -70,12 +74,12 @@ func TestNegotiate(t *testing.T) {
 		reason       string // substring
 		missing      string
 	}{
-		{"all six", ok(jsonOf(t, fullCaps())), true, true, "", ""},
-		{"no consumer", ok(jsonOf(t, without("consumer-v1"))), false, true, "consumer-v1", "consumer-v1"},
-		{"no pause", ok(jsonOf(t, without("pause-v1"))), false, true, "pause-v1", "pause-v1"},
-		{"host without locking tools", ok(jsonOf(t, statusOnly)), false, true, "ownership-v1", "delivery-v1,ownership-v1,pause-v1,runner-v1,consumer-v1"},
-		{"no status", ok(jsonOf(t, without("status-json-v1"))), false, false, "status-json-v1", "status-json-v1"},
-		{"unknown protocol version", ok(jsonOf(t, version2)), false, false, "version 2", ""},
+		{"everything", ok(jsonOf(t, fullCaps())), true, true, "", ""},
+		{"no pause", ok(jsonOf(t, without("pause-v2"))), false, true, "pause-v2", "pause-v2"},
+		{"host without a lock helper", ok(jsonOf(t, noLockHelper)), false, true, "handlers-v1", "handlers-v1"},
+		{"no status", ok(jsonOf(t, without("status-json-v2"))), false, false, "status-json-v2", "status-json-v2"},
+		{"protocol 1, an older Groundhog", ok(jsonOf(t, protocol1)), false, false, "older Groundhog (runtime protocol 1", ""},
+		{"unknown protocol version", ok(jsonOf(t, version3)), false, false, "version 3", ""},
 		{"other protocol", ok(jsonOf(t, otherProtocol)), false, false, "something-else", ""},
 		{"legacy script", exits(1, "error: unknown command 'capabilities'\n"), false, false, "legacy", ""},
 		{"legacy script, other exit", exits(2, "usage: groundhog.sh <command>\n"), false, false, "exit 2", ""},
@@ -110,10 +114,10 @@ func TestNegotiate(t *testing.T) {
 
 func TestNegotiateMissingIsSorted(t *testing.T) {
 	doc := fullCaps()
-	doc["capabilities"] = []string{"status-json-v1"}
+	doc["capabilities"] = []string{"next-due-v1"}
 	f := newFake(t).on("capabilities", ok(jsonOf(t, doc)))
 	sup, _ := newClient(t, f).Negotiate(context.Background())
-	want := "consumer-v1,delivery-v1,ownership-v1,pause-v1,runner-v1"
+	want := "handlers-v1,pause-v2,status-json-v2"
 	if got := strings.Join(sup.Missing, ","); got != want {
 		t.Errorf("missing %q, want %q", got, want)
 	}
@@ -140,13 +144,11 @@ func TestUnsupportedScriptNeverReceivesControl(t *testing.T) {
 	legacy := exits(1, "error: unknown command 'capabilities'")
 	f := newFake(t).on("capabilities", legacy)
 	c := newClient(t, f)
-	tok := "/example/session/token"
 	calls := []func() error{
-		func() error { return c.Enroll(context.Background(), "demo", tok) },
-		func() error { return c.Pause(context.Background(), tok) },
-		func() error { return c.Resume(context.Background(), tok) },
-		func() error { return c.Stop(context.Background(), tok) },
-		func() error { return c.Release(context.Background(), tok) },
+		func() error { return c.Tick(context.Background()) },
+		func() error { return c.Retry(context.Background(), "out/report") },
+		func() error { return c.Pause(context.Background()) },
+		func() error { return c.Resume(context.Background()) },
 	}
 	for i, call := range calls {
 		err := call()
@@ -168,7 +170,7 @@ func TestNegotiationIsRememberedUntilRenegotiated(t *testing.T) {
 		on("pause", ok("paused\n"))
 	c := newClient(t, f)
 	for i := 0; i < 3; i++ {
-		if err := c.Pause(context.Background(), "/example/session/token"); err != nil {
+		if err := c.Pause(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -180,7 +182,7 @@ func TestNegotiationIsRememberedUntilRenegotiated(t *testing.T) {
 	if sup, err := c.Negotiate(context.Background()); err != nil || sup.Controllable {
 		t.Fatalf("%+v %v", sup, err)
 	}
-	if err := c.Pause(context.Background(), "/example/session/token"); !errors.Is(err, ErrUnsupported) {
+	if err := c.Pause(context.Background()); !errors.Is(err, ErrUnsupported) {
 		t.Errorf("after renegotiation: %v", err)
 	}
 }

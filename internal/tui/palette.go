@@ -15,7 +15,7 @@ import (
 
 // The command palette follows EasyLoom's: every action, found by typing, run
 // by Enter. Quit and everything that changes anything live here and nowhere
-// else. Run, Stop, Pause item, Unpause item, Quit and Refresh are strict: they match only a prefix of
+// else. Every action that changes anything, Quit and Refresh are strict: they match only a prefix of
 // their name, with no aliases and no scattered letters, so a sentence typed
 // into the wrong tmux pane reaches them only by ending, after a colon, in
 // their exact name or a prefix of it ("q: quit"). Open folder keeps its
@@ -44,16 +44,9 @@ type palette struct {
 	// shows so the reader sees what Run or Stop will act on.
 	label string
 	// node is the key of the node that was selected when the palette opened (the
-	// instance or one of its items). A settling action runs on that node or not
-	// at all: on an item it settles that item's deliveries only.
+	// instance or one of its items). Retry and the item toggles run on that node
+	// or not at all: on an item Retry retries that item's deliveries only.
 	node string
-	// confirming is set once the reader chose Run on an instance that asks first
-	// (Node.RunConfirm): the palette shows the question and waits for Enter or y,
-	// or Esc, n. Nothing else in it moves or types meanwhile.
-	confirming bool
-	// confirmed is set only for the run that follows the reader's yes, so that
-	// run does not ask again. It reaches no other call.
-	confirmed bool
 }
 
 type command struct {
@@ -73,8 +66,8 @@ type command struct {
 
 // hue colours the command's glyph the way EasyLoom does: an action that moves
 // something takes the hue of the state it leads to (Run the running green,
-// Stop the stopped grey), one that settles a delivery the warning orange as
-// drop does there, and the rest (open, refresh, show, quit) stay the quiet grey.
+// Stop the stopped grey), Retry the warning orange as drop does there, and the
+// rest (open, refresh, show, quit) stay the quiet grey.
 // The glyph and the name carry the meaning with colour off.
 func (c command) hue(s styles) lipgloss.Style {
 	switch {
@@ -82,11 +75,13 @@ func (c command) hue(s styles) lipgloss.Style {
 		return s.state[StateRunning]
 	case c.action == ActionStop:
 		return s.state[StateStopped]
-	case c.action == ActionPauseItem:
+	case c.action == ActionPauseItem, c.action == ActionPause:
 		return s.state[StatePaused]
 	case c.action == ActionUnpauseItem:
 		return s.state[StateScheduled]
-	case c.action.settles():
+	case c.action == ActionUnpause:
+		return s.state[StateRunning]
+	case c.action == ActionRetry:
 		return s.warn
 	}
 	return s.soft
@@ -117,13 +112,15 @@ var allCommands = []command{
 	// strict like Run and Stop; "p" and "u" find them only on an item that offers one.
 	{ActionPauseItem, "Pause item", "", "◐", "", true, false},
 	{ActionUnpauseItem, "Unpause item", "", "◷", "", true, false},
+	// The instance pause holds every ticker of the instance back, so it is
+	// strict too; "pause in" and "pause it" tell it from Pause item.
+	{ActionPause, "Pause instance", "", "◑", "", true, false},
+	{ActionUnpause, "Unpause instance", "", "▷", "", true, false},
 	{ActionOpenFolder, "Open folder", "finder reveal files directory explorer show", "▤", "", false, false},
 	{ActionRefresh, "Refresh", "", "↻", "", true, false},
-	// The settling actions change deliveries, so they are strict like Run and
-	// Stop. They follow Refresh, so that "re" still finds Refresh first.
-	{ActionRetryFailed, "Retry failed", "", "↺", "", true, false},
-	{ActionRecoverAccept, "Recover as done", "", "✓", "", true, false},
-	{ActionRecoverRetry, "Recover and retry", "", "↺", "", true, false},
+	// Retry starts runs again, so it is strict like Run and Stop. It follows
+	// Refresh, so that "re" still finds Refresh first.
+	{ActionRetry, "Retry", "", "↺", "", true, false},
 	// ToggleHidden's name changes with the preference; see commands(). It is a view
 	// action that starts nothing, so it keeps aliases and fuzzy matching.
 	{ActionToggleHidden, "Show hidden instances", "show hidden hide unsupported malformed legacy filter", "◌", "", false, true},
@@ -141,17 +138,15 @@ func (m Model) commands() []command {
 				allowed[a] = true
 			}
 		}
-		// A settling action, Pause item and Unpause item are the selected node's own:
-		// an item lists the settling actions its deliveries earn, and the toggle its
-		// folder's name allows.
+		// Retry, Pause item and Unpause item are the selected node's own: an item
+		// lists the Retry its deliveries earn, and the toggle its folder's name allows.
 		for _, a := range r.node.Actions {
 			if a.onNode() {
 				allowed[a] = true
 			}
 		}
 		if _, working := m.busy[r.instance.Key]; working {
-			// One Run, Stop or settling action at a time per instance; the
-			// answer is awaited.
+			// One action at a time per instance; the answer is awaited.
 			for a := range allowed {
 				if a.acts() {
 					delete(allowed, a)
@@ -319,9 +314,6 @@ func (m Model) openPalette() Model {
 // updatePalette takes every key while the palette is open.
 func (m Model) updatePalette(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	p := *m.palette
-	if p.confirming {
-		return m.updateConfirm(p, k)
-	}
 	matches := m.filtered()
 	at := -1 // where the chosen action sits in the list now, -1 if absent
 	for i, c := range matches {
@@ -448,20 +440,11 @@ func (m Model) run(p palette) (tea.Model, tea.Cmd) {
 		req.NodeKey, req.InstanceKey = r.node.Key, r.instance.Key
 		if a.onNode() && r.node != r.instance && r.node.Payload != nil {
 			req.ItemPath = r.node.Payload.Rel
-			if a.settles() {
+			if a == ActionRetry {
 				// Delivery records carry the path an item fired under, which has no
 				// `.paused` on its own folder; the toggles need the folder as it is.
 				req.ItemPath = core.ItemIdentity(req.ItemPath)
 			}
-		}
-	}
-	if a == ActionRun && !p.confirmed {
-		if r := m.selectedRow(); r != nil && r.instance.RunConfirm != "" {
-			// Ask first. The offer and the binding were checked above, and the
-			// reader's yes runs them again before anything starts.
-			p.confirming = true
-			m.palette = &p
-			return m, nil
 		}
 	}
 	m.palette = nil
@@ -480,33 +463,6 @@ func (m Model) run(p palette) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 	return m, m.handler(req)
-}
-
-// updateConfirm takes the keys of the confirmation step. Enter or y runs: it
-// goes back through run, which refuses unless the palette still offers Run on
-// the instance it was opened on, so a refresh that took Run away, or moved the
-// selection, since the question was shown runs nothing. Esc, ctrl+g or n
-// cancels and closes the palette. Every other key does nothing, so text typed
-// into the pane cannot answer it.
-func (m Model) updateConfirm(p palette, k tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch k.String() {
-	case "enter", "y":
-		p.confirmed = true
-		return m.run(p)
-	case "esc", "ctrl+g", "n":
-		m.palette = nil
-		m.notice, m.failure = "Nothing ran: Run was cancelled for "+p.label, false
-	}
-	return m, nil
-}
-
-// confirmText is the question for the bound instance, as the last read states
-// it, or a plain one if a refresh has since cleared the reason to ask.
-func (m Model) confirmText() string {
-	if r := m.selectedRow(); r != nil && r.instance.Key == m.palette.instance && r.instance.RunConfirm != "" {
-		return r.instance.RunConfirm
-	}
-	return "Run " + m.palette.label + "?"
 }
 
 // overlay draws the palette box over the frame, fading the frame behind it.
@@ -555,9 +511,6 @@ func (m Model) renderPalette(width int) string {
 	prompt := padTo(" "+s.brand.Render(paletteKey)+" "+query, inner-lipgloss.Width(count))
 	prompt = ansi.Truncate(prompt, inner-lipgloss.Width(count), "") + count
 
-	if p.confirming {
-		return m.renderConfirm(prompt, inner)
-	}
 	rows := max(1, min(paletteRows, min(len(m.commands()), h-6)))
 	start := 0
 	if c := m.cursor(); c >= rows {
@@ -582,30 +535,10 @@ func (m Model) renderPalette(width int) string {
 	return s.border.Render(strings.Join(lines, "\n"))
 }
 
-// renderConfirm draws the confirmation in the palette's box, keeping its prompt
-// line (which names the bound instance) and replacing the list with the question.
-func (m Model) renderConfirm(prompt string, inner int) string {
-	s := m.styles
-	lines := []string{prompt, s.faint.Render(strings.Repeat("─", inner))}
-	for _, l := range strings.Split(ansi.Wrap(cleanLine(m.confirmText()), inner-2, ""), "\n") {
-		lines = append(lines, padTo(" "+s.warn.Render(l), inner))
-	}
-	keys := s.hintKey.Render("enter") + s.hint.Render(" or ") + s.hintKey.Render("y") + s.hint.Render(" run   ") +
-		s.hintKey.Render("esc") + s.hint.Render(" cancel")
-	lines = append(lines, s.faint.Render(strings.Repeat("─", inner)), padTo(ansi.Truncate(" "+keys, inner, ""), inner))
-	return s.border.Render(strings.Join(lines, "\n"))
-}
-
-// rowNote is the hint beside Run, or beside a settling or toggle action, for the node the
-// palette is bound to.
+// rowNote is the hint beside Retry or an item toggle, for the node the palette
+// is bound to.
 func (m Model) rowNote(a Action) string {
-	r := m.selectedRow()
-	switch {
-	case r == nil:
-		return ""
-	case a == ActionRun:
-		return r.instance.RunNote
-	case a.onNode():
+	if r := m.selectedRow(); r != nil && a.onNode() {
 		return r.node.ActionNotes[a]
 	}
 	return ""

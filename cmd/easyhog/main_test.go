@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode"
@@ -156,43 +158,74 @@ func TestVersionPrintsTheStampedVersionAndRunsNothing(t *testing.T) {
 	}
 }
 
-func TestShutdownWithNothingSupervisedSaysNothingAndDoesNotWait(t *testing.T) {
-	sup, err := core.NewSupervisor(core.SupervisorConfig{Exec: runner.Process{}, Launcher: runner.Spawner{}, StateDir: t.TempDir()})
+func TestShutdownWithNothingTickedDoesNotWaitAndRefusesMore(t *testing.T) {
+	tk, err := core.NewTicker(core.TickerConfig{Clients: core.NewClients(runner.Process{})})
 	if err != nil {
 		t.Fatal(err)
 	}
-	var diagnostics bytes.Buffer
 	done := make(chan struct{})
-	go func() { shutdown(sup, nil, &diagnostics); close(done) }()
+	go func() { shutdown(tk, nil, io.Discard); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("shutdown waited with nothing to stop")
 	}
-	if diagnostics.Len() != 0 {
-		t.Errorf("stderr: %q", diagnostics.String())
-	}
-	if _, err := sup.Run(context.Background(), "/nowhere/.groundhog"); err == nil {
+	if _, err := tk.Run(context.Background(), "/nowhere/.groundhog"); err == nil {
 		t.Error("Run worked after shutdown")
 	}
 }
 
-// Adoption's scope follows what discovery lists: beneath the root, or beneath an
-// included directory (relative ones taken from the root). Nothing else.
-func TestAdoptScopeCoversTheRootAndIncludedDirectoriesOnly(t *testing.T) {
-	tmp := t.TempDir()
-	root := filepath.Join(tmp, "repos")
-	extra := filepath.Join(tmp, "extra")
-	inScope := adoptScope(root, []string{extra, "vendored"})
-	for path, want := range map[string]bool{
-		filepath.Join(root, "a", ".groundhog"):             true,
-		filepath.Join(root, "vendored", "b", ".groundhog"): true,
-		filepath.Join(extra, "c", ".groundhog"):            true,
-		filepath.Join(tmp, "elsewhere", "d", ".groundhog"): false,
-		filepath.Join(tmp, "repos-two", "e", ".groundhog"): false, // a sibling sharing a name prefix
-	} {
-		if got := inScope(path); got != want {
-			t.Errorf("inScope(%s) = %v, want %v", path, got, want)
+// hungTick answers capabilities and makes every tick hang until its context ends.
+type hungTick struct{}
+
+func (hungTick) Run(ctx context.Context, inv runner.Invocation) error {
+	if inv.Args[0] == "capabilities" {
+		_, err := io.WriteString(inv.Stdout, `{"protocol":"groundhog-runtime","protocol_version":2,"capabilities":["status-json-v2","pause-v2","handlers-v1"]}`)
+		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+func (s *syncBuffer) String() string { s.mu.Lock(); defer s.mu.Unlock(); return s.b.String() }
+
+// Quit waits for a tick under way. Past about a second it says so on stderr,
+// and a further signal ends the wait.
+func TestShutdownSaysWhenItWaitsForATickAndASignalEndsTheWait(t *testing.T) {
+	tk, err := core.NewTicker(core.TickerConfig{Clients: core.NewClients(hungTick{})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := tk.Run(ctx, "/synthetic/proj/.groundhog"); err != nil { // returns at ctx; the tick hangs
+		t.Fatal(err)
+	}
+	var stderr syncBuffer
+	sigs := make(chan os.Signal, 1)
+	done := make(chan struct{})
+	go func() { shutdown(tk, sigs, &stderr); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(stderr.String(), "waiting for a tick under way; ctrl+c leaves now") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no notice after waiting; stderr %q", stderr.String())
 		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	sigs <- os.Interrupt
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a signal did not end the wait")
 	}
 }

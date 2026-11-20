@@ -37,7 +37,6 @@ func TestItemIdentityIgnoresTheItemsOwnPausedSuffix(t *testing.T) {
 }
 
 func itemsView(class Class, st groundhog.Status, items ...groundhog.ScheduleItem) InstanceView {
-	st.Consistent = true
 	st.Schedule = items
 	return InstanceView{Class: class, Inspection: Inspection{Last: &Observation{Status: st}}}
 }
@@ -52,66 +51,48 @@ func pausedItem(path string, by ...string) groundhog.ScheduleItem {
 	return it
 }
 
-func TestItemOffersFollowTheItemsFolderAndTheInstancesOwnership(t *testing.T) {
+func TestItemOffersFollowTheItemsFolder(t *testing.T) {
 	const a, ap = "schedule/daily/a", "schedule/daily/a.paused"
-	stopped := groundhog.Status{Runner: groundhog.Runner{State: groundhog.RunnerStopped}}
-	running := groundhog.Status{Runner: groundhog.Runner{State: groundhog.RunnerRunning}, Owner: &groundhog.Owner{ID: "o"}}
-	pausedInstance := running
-	pausedInstance.Paused = true
-	stopping := running
-	stopping.Runner.State = groundhog.RunnerStopping
-
+	plain := groundhog.Status{}
+	pausedInstance := groundhog.Status{Paused: true}
+	tickedFromOutside := groundhog.Status{ObservedAt: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)}
+	tickedFromOutside.LastTick = &groundhog.LastTick{At: tickedFromOutside.ObservedAt.Add(-20 * time.Second), Source: "standalone"}
 	withHealth := func(iv InstanceView, h Health) InstanceView { iv.Health = h; return iv }
-	tickedBy := func(st groundhog.Status, source string) groundhog.Status {
-		st.ObservedAt = time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
-		st.LastTick = &groundhog.LastTick{At: st.ObservedAt.Add(-20 * time.Second), Source: source}
-		return st
-	}
 
 	for _, c := range []struct {
-		name   string
-		iv     InstanceView
-		rel    string
-		want   []Action
-		inWhy  string // the reason contains this, for a refusal
-		runner *RunnerInfo
+		name  string
+		iv    InstanceView
+		rel   string
+		want  []Action
+		inWhy string // the reason contains this, for a refusal
 	}{
-		{name: "scheduled item of an unowned instance", iv: itemsView(ClassUnowned, stopped, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
-		{name: "paused item of an unowned instance", iv: itemsView(ClassUnowned, stopped, pausedItem(ap, ap)), rel: ap, want: []Action{ActionUnpauseItem}},
-		{name: "scheduled item of this session's running instance", iv: itemsView(ClassOwnedBySession, running, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
-		{name: "paused item of this session's running instance", iv: itemsView(ClassOwnedBySession, running, pausedItem(ap, ap)), rel: ap, want: []Action{ActionUnpauseItem}},
-		{name: "an instance-wide pause is not the item's", iv: itemsView(ClassOwnedBySession, pausedInstance, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
+		{name: "a scheduled item", iv: itemsView(ClassSupported, plain, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
+		{name: "a paused item", iv: itemsView(ClassSupported, plain, pausedItem(ap, ap)), rel: ap, want: []Action{ActionUnpauseItem}},
+		{name: "an instance-wide pause is not the item's", iv: itemsView(ClassSupported, pausedInstance, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
+		{name: "ticked from outside Easyhog: the rename takes the same lock", iv: itemsView(ClassSupported, tickedFromOutside, scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
 		{name: "own name and a folder above both paused: unpausing the item is still its own act",
-			iv:  itemsView(ClassOwnedBySession, running, pausedItem("schedule/weekly.paused/mon/r.paused", "schedule/weekly.paused", "schedule/weekly.paused/mon/r.paused")),
+			iv:  itemsView(ClassSupported, plain, pausedItem("schedule/weekly.paused/mon/r.paused", "schedule/weekly.paused", "schedule/weekly.paused/mon/r.paused")),
 			rel: "schedule/weekly.paused/mon/r.paused", want: []Action{ActionUnpauseItem}},
 
 		{name: "paused through a folder above: no Unpause, and it says why",
-			iv:  itemsView(ClassOwnedBySession, running, pausedItem("schedule/weekly.paused/mon/review", "schedule/weekly.paused")),
+			iv:  itemsView(ClassSupported, plain, pausedItem("schedule/weekly.paused/mon/review", "schedule/weekly.paused")),
 			rel: "schedule/weekly.paused/mon/review", inWhy: "paused through schedule/weekly.paused, not by its own name"},
-		{name: "foo beside foo.paused: neither toggles (the plain one)", iv: itemsView(ClassUnowned, stopped, scheduled(a), pausedItem(ap, ap)), rel: a, inWhy: "both a and a.paused exist"},
-		{name: "foo beside foo.paused: neither toggles (the paused one)", iv: itemsView(ClassUnowned, stopped, scheduled(a), pausedItem(ap, ap)), rel: ap, inWhy: "both a.paused and a exist"},
-		{name: "an item the status does not list", iv: itemsView(ClassUnowned, stopped, scheduled(a)), rel: "schedule/daily/zzz", inWhy: "does not list this item"},
+		{name: "foo beside foo.paused: neither toggles (the plain one)", iv: itemsView(ClassSupported, plain, scheduled(a), pausedItem(ap, ap)), rel: a, inWhy: "both a and a.paused exist"},
+		{name: "foo beside foo.paused: neither toggles (the paused one)", iv: itemsView(ClassSupported, plain, scheduled(a), pausedItem(ap, ap)), rel: ap, inWhy: "both a.paused and a exist"},
+		{name: "an item the status does not list", iv: itemsView(ClassSupported, plain, scheduled(a)), rel: "schedule/daily/zzz", inWhy: "does not list this item"},
 
-		{name: "external", iv: itemsView(ClassExternal, running, scheduled(a)), rel: a, inWhy: "another supervisor owns it"},
-		{name: "unowned but ticked from outside Easyhog (shown external)", iv: itemsView(ClassUnowned, tickedBy(stopped, "standalone"), scheduled(a)), rel: a, inWhy: "outside Easyhog ticked this instance recently"},
-		{name: "unowned, last ticked by a runner that is gone", iv: itemsView(ClassUnowned, tickedBy(stopped, "runner"), scheduled(a)), rel: a, want: []Action{ActionPauseItem}},
 		{name: "not inspected", iv: InstanceView{Class: ClassNotInspected}, rel: a, inWhy: "first status read"},
-		{name: "unsupported", iv: itemsView(ClassUnsupported, stopped, scheduled(a)), rel: a, inWhy: "lacks the capabilities"},
-		{name: "legacy", iv: itemsView(ClassLegacy, stopped, scheduled(a)), rel: a, inWhy: "read-only"},
-		{name: "malformed", iv: itemsView(ClassMalformed, stopped, scheduled(a)), rel: a, inWhy: "malformed"},
-		{name: "stale", iv: withHealth(itemsView(ClassUnowned, stopped, scheduled(a)), HealthStale), rel: a, inWhy: "stale"},
-		{name: "inconsistent", iv: withHealth(itemsView(ClassUnowned, stopped, scheduled(a)), HealthInconsistent), rel: a, inWhy: "not coherent"},
-		{name: "inconsistent only for a journal write Run would settle: still not coherent",
-			iv:  withHealth(itemsView(ClassUnowned, groundhog.Status{Diagnostics: []groundhog.Problem{{Code: "journal_write_in_progress"}}}, scheduled(a)), HealthInconsistent),
-			rel: a, inWhy: "not coherent"},
+		{name: "unsupported", iv: itemsView(ClassUnsupported, plain, scheduled(a)), rel: a, inWhy: "lacks what ticking"},
+		{name: "legacy", iv: itemsView(ClassLegacy, plain, scheduled(a)), rel: a, inWhy: "read-only"},
+		{name: "malformed", iv: itemsView(ClassMalformed, plain, scheduled(a)), rel: a, inWhy: "malformed"},
+		{name: "stale", iv: withHealth(itemsView(ClassSupported, plain, scheduled(a)), HealthStale), rel: a, inWhy: "stale"},
 		{name: "failing read", iv: func() InstanceView {
-			v := itemsView(ClassUnowned, stopped, scheduled(a))
+			v := itemsView(ClassSupported, plain, scheduled(a))
 			v.Inspection.Err = errors.New("x")
 			return v
 		}(), rel: a, inWhy: "status can be read again"},
-		{name: "this session's runner is stopping", iv: itemsView(ClassOwnedBySession, stopping, scheduled(a)), rel: a, inWhy: "stopping"},
 	} {
-		got, why := ItemOffers(c.iv, c.runner, c.rel)
+		got, why := ItemOffers(c.iv, c.rel)
 		if len(got) != len(c.want) || (len(got) == 1 && got[0] != c.want[0]) {
 			t.Errorf("%s: offers %v (%q), want %v", c.name, got, why, c.want)
 			continue
@@ -345,4 +326,15 @@ func TestRenameItemRechecksTheTargetUnderTheLock(t *testing.T) {
 	if !isDir(filepath.Join(inst, "schedule/daily/foo")) {
 		t.Fatal("the original moved")
 	}
+}
+
+func noWait(context.Context, time.Duration) error { return nil }
+
+func mustReal(t *testing.T, p string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return real
 }

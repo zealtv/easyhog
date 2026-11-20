@@ -20,7 +20,7 @@ import (
 
 func main() {
 	scenario := flag.String("scenario", "full",
-		"synthetic data: full, empty, error, stale (older samples), or empty-view, crowded, legacy, failing, inconsistent, external (both kinds of external, with Run answered by made-up runners), actions (Run and Stop answered by made-up runners), verdicts (one instance per pending-work verdict), rows (failed, paused with a backlog, uncertain, scheduled), items (Pause item and Unpause item: scheduled, paused, paused above, a clash, external), countdown (item rows at each countdown distance, paused, fired, due now, held, no next_due), heartbeat (the mark at each level, and rows that get none)")
+		"synthetic data: full, empty, error, stale (older samples), or empty-view, crowded, legacy, failing, stale-read, external (ticked from outside, with Run answered by a made-up ticker), actions (Run and Stop answered by a made-up ticker), verdicts (one instance per pending-work verdict), rows (failed, paused with a backlog, interrupted, scheduled), items (Pause item and Unpause item: scheduled, paused, paused above, a clash, ticked from outside), countdown (item rows at each countdown distance, paused, fired, due now, held, no next_due), heartbeat (the mark at each level, and rows that get none)")
 	flag.Parse()
 
 	var model tui.Model
@@ -41,12 +41,9 @@ func main() {
 			}),
 			tui.WithFolderOpener(func(string) error { return nil }),
 		}
-		data := tui.FromView(v)
-		if *scenario == "actions" || *scenario == "verdicts" || *scenario == "rows" || *scenario == "items" || *scenario == "external" {
-			// Run and Stop are offered, and answered by made-up runners (also for verdicts).
-			data = tui.FromViewWith(v, func(string) (core.RunnerInfo, bool) { return core.RunnerInfo{}, false })
-			opts = append(opts, tui.WithRunners(syntheticRunners{}, nil))
-		}
+		// The actions are offered, and answered by a made-up ticker.
+		data := tui.FromViewWith(v, tickLookup)
+		opts = append(opts, tui.WithControl(syntheticControl{}, nil))
 		model = tui.NewWithData(data, opts...)
 	} else {
 		model = tui.NewWithData(tui.SampleData(*scenario))
@@ -57,30 +54,32 @@ func main() {
 	}
 }
 
-// syntheticRunners answers Run, Stop and the settling actions without starting anything: "contested"
-// is refused as if another supervisor had enrolled it a moment ago, "slow" never
-// answers (to capture the transitional state), and the rest succeed.
-type syntheticRunners struct{}
+// syntheticControl answers the actions without starting anything: "nolock"
+// is refused as if its script had lost what ticking needs a moment ago, "slow"
+// never answers (to capture the transitional state), and the rest succeed.
+type syntheticControl struct{}
 
-func (syntheticRunners) Run(_ context.Context, key string) (core.RunResult, error) {
+func (syntheticControl) Run(_ context.Context, key string) (core.RunResult, error) {
 	switch {
-	case strings.Contains(key, "/contested/"):
-		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedExternal,
-			Detail: `owner "team-supervisor" is recorded; ownership and runner liveness are separate, and a stopped owner is not available for takeover`}
+	case strings.Contains(key, "/nolock/"):
+		return core.RunResult{}, &core.RefusedError{Op: "run", Instance: key, Reason: core.RefusedUnsupported,
+			Detail: "lacks required capabilities: handlers-v1"}
 	case strings.Contains(key, "/slow/"):
 		time.Sleep(time.Hour)
 	}
-	return core.RunResult{Instance: key, Outcome: core.RunStarted, Enrolled: true, PID: 40213, Seen: true}, nil
+	return core.RunResult{Instance: key, Ticked: true}, nil
 }
 
-func (syntheticRunners) Stop(_ context.Context, key string) (core.StopResult, error) {
-	return core.StopResult{Instance: key}, nil
+func (syntheticControl) Stop(key string) core.StopResult {
+	return core.StopResult{Instance: key, WasTicking: true}
 }
 
-func (syntheticRunners) SetItemPaused(_ context.Context, key, item string, pause bool) (core.ItemResult, error) {
+func (syntheticControl) Retry(_ context.Context, key, _ string) (core.RetryResult, error) {
+	return core.RetryResult{Instance: key, Started: []string{"out/beat-1"}}, nil
+}
+
+func (syntheticControl) SetPaused(context.Context, string, bool) error { return nil }
+
+func (syntheticControl) SetItemPaused(_ context.Context, key, item string, pause bool) (core.ItemResult, error) {
 	return core.ItemResult{Instance: key, Item: core.ItemIdentity(item), From: item, To: core.ItemTarget(item, pause), Paused: pause, Locked: true}, nil
-}
-
-func (syntheticRunners) Settle(_ context.Context, key string, req core.SettleRequest) (core.SettleResult, error) {
-	return core.SettleResult{Instance: key, Action: req.Action, Settled: []string{"d-1"}, StoppedRunner: true, Restarted: true, PID: 40214, Seen: true}, nil
 }

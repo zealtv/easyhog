@@ -72,15 +72,14 @@ func newStyles() styles {
 			core.HeartbeatQuiet: lipgloss.NewStyle().Foreground(faint),
 		},
 		state: map[State]lipgloss.Style{
-			StateStopped:      lipgloss.NewStyle().Foreground(faint),
-			StateRunning:      lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
-			StatePaused:       lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
-			StateExternal:     lipgloss.NewStyle().Foreground(lipgloss.Color("141")),
-			StateUnsupported:  lipgloss.NewStyle().Foreground(lipgloss.Color("214")),
-			StatePending:      lipgloss.NewStyle().Foreground(lipgloss.Color("3")),
-			StateFailed:       lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
-			StateInconsistent: lipgloss.NewStyle().Foreground(lipgloss.Color("5")),
-			StateScheduled:    lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "248"}),
+			StateStopped:     lipgloss.NewStyle().Foreground(faint),
+			StateRunning:     lipgloss.NewStyle().Foreground(lipgloss.Color("2")),
+			StatePaused:      lipgloss.NewStyle().Foreground(lipgloss.Color("11")),
+			StateExternal:    lipgloss.NewStyle().Foreground(lipgloss.Color("141")),
+			StateUnsupported: lipgloss.NewStyle().Foreground(lipgloss.Color("214")),
+			StatePending:     lipgloss.NewStyle().Foreground(lipgloss.Color("3")),
+			StateFailed:      lipgloss.NewStyle().Foreground(lipgloss.Color("1")),
+			StateScheduled:   lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "240", Dark: "248"}),
 		},
 	}
 }

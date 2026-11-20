@@ -5,3 +5,4 @@
 /.easyhog/
 *.log
 /.cache/
+/cmd/easyhog/easyhog

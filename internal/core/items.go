@@ -25,8 +25,8 @@ const (
 	PausedSuffix = ".paused"
 
 	// ActionPauseItem and ActionUnpauseItem act on one schedule item, not on the
-	// instance's runner. They are the item's own offers, as the settling actions
-	// are (OffersOn), and ItemOffers is their rule.
+	// instance. They are the item's own offers, as Retry on an item is
+	// (OffersOn), and ItemOffers is their rule.
 	ActionPauseItem   Action = "pause-item"
 	ActionUnpauseItem Action = "unpause-item"
 )
@@ -81,28 +81,20 @@ func ItemClash(st groundhog.Status, rel string) (other string, clash bool) {
 
 // ItemOffers says whether the item at rel (a status schedule path) offers Pause
 // item or Unpause item, and when it offers neither, why. It is the one rule: the
-// palette lists what it returns, and the supervisor applies it to its own fresh
-// read before renaming anything.
+// palette lists what it returns, and Ticker.SetItemPaused applies it to its own
+// fresh read before renaming anything.
 //
-//   - The instance must be one Easyhog may act on: unowned (stopped), or one of
-//     this session's; the same test as Run's (baseOffers), plus a coherent, current
-//     status. An instance that something outside Easyhog drives is refused, as the
-//     rest of the palette refuses it: its owner, or the loop ticking it, keeps its
-//     own schedule. This is the narrowest rule that works; it could widen later.
+//   - The instance must be one Easyhog may act on (Offers offers something):
+//     supported, with a current status. Who ticks it does not matter: the
+//     rename takes Groundhog's mutation lock, as every writer does.
 //   - `foo` and `foo.paused` side by side: neither toggles, since either rename
 //     would land on the other.
 //   - A paused item (its own folder name says so) offers Unpause; an item not
 //     paused by its own name but through a folder above it offers nothing, since
 //     the pause is that folder's to lift; any other item offers Pause.
-func ItemOffers(iv InstanceView, runner *RunnerInfo, rel string) (actions []Action, why string) {
-	if base, reason := baseOffers(iv, runner); len(base) == 0 {
-		return nil, reason
-	}
-	switch {
-	case TickedFromOutside(iv):
-		return nil, "something outside Easyhog ticked this instance recently, so Easyhog leaves its schedule alone."
-	case iv.Health != HealthOK:
-		return nil, "its status is not coherent; it will be offered once a coherent read arrives."
+func ItemOffers(iv InstanceView, rel string) (actions []Action, why string) {
+	if why := notActionable(iv); why != "" {
+		return nil, why
 	}
 	st := iv.Inspection.Last.Status
 	var item *groundhog.ScheduleItem
@@ -126,16 +118,6 @@ func ItemOffers(iv InstanceView, runner *RunnerInfo, rel string) (actions []Acti
 		}
 	}
 	return []Action{ActionPauseItem}, ""
-}
-
-// TickedFromOutside reports whether iv is an unowned instance that something
-// outside Easyhog ticked recently, which the shell shows as external.
-func TickedFromOutside(iv InstanceView) bool {
-	if iv.Class != ClassUnowned {
-		return false
-	}
-	v, ok := PendingVerdict(iv)
-	return ok && v.Outlook == OutlookProbably && v.Source == "standalone"
 }
 
 // ItemResult is what a toggle that went through did.
@@ -172,10 +154,9 @@ const (
 //     must not exist (ErrItemExists). The check is repeated under the lock.
 //   - It takes Groundhog's mutation lock around the rename, the lock every
 //     Groundhog writer holds (README, Locks; a flock(2) on runtime/locks/
-//     mutation.lock). The runner's tick holds it while it walks schedule/ and
-//     copies a due item (`cp -R`), and a rename in the middle of that fails the
-//     copy and, for the runner, the tick: it stops with tick_failed. So the
-//     rename waits its turn. A lock held for the whole wait is ErrItemBusy; a
+//     mutation.lock). A tick holds it while it walks schedule/ and copies a
+//     due item (`cp -R`), and a rename in the middle of that fails the copy and
+//     the firing (`firing_failed`). So the rename waits its turn. A lock held for the whole wait is ErrItemBusy; a
 //     lock file that does not exist means no writer has run here, and the rename
 //     goes ahead without one (ItemResult.Locked says which).
 //
@@ -302,57 +283,44 @@ func itemActionOf(pause bool) Action {
 }
 
 // SetItemPaused pauses (pause) or unpauses one schedule item of the instance at
-// key by renaming its folder (RenameItem), on the instance's operation slot, so
-// it never overlaps a Run, Stop or settling action on the same instance. It
-// reads a fresh coherent status and applies ItemOffers to it, so the rule the
-// palette showed is checked at the protocol; refused, it renames nothing. The
-// instance's runner, if this session runs one, keeps running: the rename holds
-// the mutation lock for a moment, as any control command does, and the next
-// tick sees the new name. The caller re-reads the instance's status afterwards
-// (the refresher's Reinspect) so the row shows the change.
-func (s *Supervisor) SetItemPaused(ctx context.Context, key, item string, pause bool) (ItemResult, error) {
+// key by renaming its folder (RenameItem). It reads a fresh status and applies
+// ItemOffers to it, so the rule the palette showed is checked at the protocol;
+// refused, it renames nothing. Ticking goes on: the rename holds the mutation
+// lock for a moment, and the next tick sees the new name. The caller re-reads
+// the instance's status afterwards so the row shows the change.
+func (t *Ticker) SetItemPaused(ctx context.Context, key, item string, pause bool) (ItemResult, error) {
 	op := "unpause-item"
 	if pause {
 		op = "pause-item"
 	}
 	res := ItemResult{Instance: key, Item: ItemIdentity(item), Paused: pause}
-	ctx, done := s.opContext(ctx)
-	defer done()
-	sess, err := s.sessionFor(op, key)
+	if err := t.open(op, key); err != nil {
+		return res, err
+	}
+	c, err := t.cfg.Clients.For(key)
 	if err != nil {
 		return res, err
 	}
-	if err := sess.acquire(ctx); err != nil {
-		return res, err
-	}
-	defer sess.release()
-	if err := s.closingErr(op, key); err != nil {
-		return res, err
-	}
-	st, err := s.readStatus(ctx, sess.client)
+	sup, err := c.Negotiate(ctx)
 	if err != nil {
-		return res, refuseIfInconsistent(op, key, err)
+		return res, err
 	}
-	s.mu.Lock()
-	held := sess.holds()
-	s.mu.Unlock()
-	if held {
-		s.applyRule(sess, st) // drops a token the status shows no longer controls the instance
+	st, err := c.Status(ctx)
+	if err != nil {
+		return res, err
 	}
-	iv, runner := s.freshView(sess, st, nil)
-	offered, why := ItemOffers(iv, runner, item)
-	switch {
-	case slices.Contains(offered, itemActionOf(pause)):
-	case iv.Class == ClassExternal || TickedFromOutside(iv):
-		return res, &RefusedError{Op: op, Instance: key, Reason: RefusedExternal,
-			Detail: "another supervisor owns it, or something outside Easyhog ticks it, so Easyhog leaves its schedule alone"}
-	default:
+	iv := InstanceView{Class: ClassSupported, Inspection: Inspection{Support: &sup, Last: &Observation{Status: st}}}
+	if !sup.Controllable {
+		iv.Class = ClassUnsupported
+	}
+	offered, why := ItemOffers(iv, item)
+	if !slices.Contains(offered, itemActionOf(pause)) {
 		if why == "" {
 			why = "the fresh read offers " + actionList(offered) + " for this item, not " + string(itemActionOf(pause))
 		}
 		return res, &RefusedError{Op: op, Instance: key, Reason: RefusedNotOffered, Detail: why}
 	}
-	r, err := RenameItem(ctx, key, item, pause, s.cfg.Sleep)
+	r, err := RenameItem(ctx, key, item, pause, t.cfg.Sleep)
 	r.Instance = key
 	return r, err
 }
@@ -364,4 +332,18 @@ func actionList(as []Action) string {
 		names[i] = string(a)
 	}
 	return strings.Join(names, ", ")
+}
+
+// Within reports whether path is dir or lies below it, after resolving symlinks
+// where the paths exist. It is core's one "beneath" test: item renames use it,
+// and so does cmd/easyhog's -include scope.
+func Within(dir, path string) bool {
+	if real, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = real
+	}
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
