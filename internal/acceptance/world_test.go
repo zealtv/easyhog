@@ -121,7 +121,8 @@ func (w *world) openSession() {
 	// The interval is far above one `status` call (the pinned script takes
 	// well under a second), or the selected instance would read as stale.
 	if w.ref, err = core.NewRefresher(core.Config{Root: w.root, FS: discovery.OS{}, Exec: runner.Process{}, Clients: clients,
-		Interval: 2 * time.Second, SelectSettle: 20 * time.Millisecond, DiscoverEvery: time.Hour}); err != nil {
+		Interval: 2 * time.Second, SelectSettle: 20 * time.Millisecond, DiscoverEvery: time.Hour,
+		RereadEvery: -1}); err != nil { // the re-read has its own tests in core; its timer would make a session time-dependent
 		t.Fatal(err)
 	}
 	if err := w.ref.Rescan(w.ctx); err != nil {
@@ -314,12 +315,17 @@ func typed(s string) []tea.Msg {
 func press(t tea.KeyType) tea.Msg { return tea.KeyMsg{Type: t} }
 
 // until polls cond, feeding the model fresh views, until it holds or time runs out.
+// Once cond holds it feeds the model once more: cond reads the refresher, and a
+// read that landed between the sync and cond would otherwise leave the model's
+// screen one view behind (TestPendingWorkVerdict's "quiet" preview still read
+// "not inspected" once, in a release check on 2026-11-27).
 func (w *world) until(what string, limit time.Duration, cond func() bool) {
 	w.t.Helper()
 	deadline := time.Now().Add(limit)
 	for {
 		w.sync()
 		if cond() {
+			w.sync()
 			return
 		}
 		if time.Now().After(deadline) {
@@ -446,7 +452,7 @@ func (w *world) palette(command string) (quit bool) {
 // refresher's newer view first: a reader acting before the screen caught up.
 func (w *world) paletteAsSeen(command string) (quit bool) {
 	w.t.Helper()
-	w.send(typed(":" + command)...)
+	w.send(typed(">" + command)...)
 	return w.send(press(tea.KeyEnter))
 }
 
@@ -512,7 +518,7 @@ func (w *world) await(what string, limit time.Duration, cond func() bool) {
 func (w *world) offers(name string) bool {
 	w.t.Helper()
 	w.sync() // as palette does
-	w.send(typed(":" + name)...)
+	w.send(typed(">" + name)...)
 	row := regexp.MustCompile(`│\s+(?:❯\s+)?\S\s+` + regexp.QuoteMeta(strings.ToUpper(name[:1])+name[1:]) + `\s+(?:.*)│`)
 	found := row.MatchString(w.screen())
 	w.send(press(tea.KeyEsc))

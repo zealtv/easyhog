@@ -197,7 +197,7 @@ func TestRefreshRunsOnlyFromThePalette(t *testing.T) {
 			t.Fatalf("a bare key refreshed: %v", k)
 		}
 	}
-	m, _ = update(m, typeText(":refresh")...)
+	m, _ = update(m, typeText(">refresh")...)
 	m, msgs = update(m, key(tea.KeyEnter))
 	if calls != 1 || len(msgs) != 1 {
 		t.Fatalf("calls %d msgs %v", calls, msgs)

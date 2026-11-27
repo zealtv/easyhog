@@ -17,14 +17,14 @@ import (
 // by Enter. Quit and everything that changes anything live here and nowhere
 // else. Every action that changes anything, Quit and Refresh are strict: they match only a prefix of
 // their name, with no aliases and no scattered letters, so a sentence typed
-// into the wrong tmux pane reaches them only by ending, after a colon, in
-// their exact name or a prefix of it ("q: quit"). Open folder keeps its
+// into the wrong tmux pane reaches them only by ending, after a ">", in
+// their exact name or a prefix of it ("q> quit"). Open folder keeps its
 // aliases: at worst a sentence opens a file manager. The palette selects
-// nothing until the reader has typed or moved, which makes ":" then Enter do
+// nothing until the reader has typed or moved, which makes ">" then Enter do
 // nothing at all.
 
 // paletteKey opens the palette.
-const paletteKey = ":"
+const paletteKey = ">"
 
 // paletteRows is how many commands the palette shows at most.
 const paletteRows = 10

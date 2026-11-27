@@ -85,6 +85,7 @@ func TestKeyRoutingNeverQuitsOrActs(t *testing.T) {
 	keys = append(keys,
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("quit"), Paste: true},
 		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(":"), Paste: true},
+		tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(">"), Paste: true},
 		tea.KeyMsg{Type: tea.KeyEnter, Alt: true}, tea.KeyMsg{Type: tea.KeyUp, Alt: true})
 
 	for _, focus := range []pane{paneTree, panePreview} {
@@ -180,7 +181,7 @@ func TestMouseOnlyInspects(t *testing.T) {
 
 func TestPaletteOpensEmptyAndEnterAloneDoesNothing(t *testing.T) {
 	m, sp := newSpied(t, "full")
-	m, _ = feed(m, typeText(":")...)
+	m, _ = feed(m, typeText(">")...)
 	if m.palette == nil || m.palette.chosen != "" {
 		t.Fatalf("palette = %#v", m.palette)
 	}
@@ -197,7 +198,7 @@ func TestPaletteOpensEmptyAndEnterAloneDoesNothing(t *testing.T) {
 
 func TestPaletteQuitOnlyThroughPalette(t *testing.T) {
 	m, sp := newSpied(t, "full")
-	m, _ = feed(m, typeText(":qui")...)
+	m, _ = feed(m, typeText(">qui")...)
 	_, cmd := m.Update(key(tea.KeyEnter))
 	if !quits(cmd) {
 		t.Fatal("palette Quit did not quit")
@@ -228,7 +229,7 @@ func TestPaletteActionsGoThroughHandlerAndValidOnly(t *testing.T) {
 		t.Fatalf("gamma commands = %s", got)
 	}
 	m, _ = feed(m, key(tea.KeyUp))
-	m, _ = feed(m, typeText(":run")...)
+	m, _ = feed(m, typeText(">run")...)
 	m, _ = feed(m, key(tea.KeyEnter))
 	if len(sp.calls) != 1 || sp.calls[0].Action != ActionRun || sp.calls[0].InstanceKey != "beta" {
 		t.Fatalf("calls = %#v", sp.calls)
@@ -237,7 +238,7 @@ func TestPaletteActionsGoThroughHandlerAndValidOnly(t *testing.T) {
 		t.Fatal("palette stayed open after running")
 	}
 	// Typing a hidden action finds nothing to run.
-	m, _ = feed(m, typeText(":stop")...)
+	m, _ = feed(m, typeText(">stop")...)
 	for _, c := range m.filtered() {
 		if c.action == ActionStop {
 			t.Fatal("invalid action offered")
@@ -247,7 +248,7 @@ func TestPaletteActionsGoThroughHandlerAndValidOnly(t *testing.T) {
 
 func TestDefaultHandlerReportsNotAvailable(t *testing.T) {
 	m := NewWithData(SampleData("full"))
-	m, _ = feed(m, typeText(":stop")...)
+	m, _ = feed(m, typeText(">stop")...)
 	m, cmd := feed(m, key(tea.KeyEnter))
 	if cmd == nil {
 		t.Fatal("no result command")
@@ -599,7 +600,7 @@ func snapshotWith(actions map[string][]Action, drop ...string) SnapshotMsg {
 // reports alpha stopped, and Run is now offered. Enter must not send Stop or Run.
 func TestPaletteRefreshFlippingStopToRunRunsNothing(t *testing.T) {
 	m, sp := newSpied(t, "full")
-	m, _ = feed(m, typeText(":st")...)
+	m, _ = feed(m, typeText(">st")...)
 	m, _ = feed(m, snapshotWith(map[string][]Action{"alpha": {ActionRun, ActionOpenFolder}}))
 	m, cmd := feed(m, key(tea.KeyEnter))
 	if len(sp.calls) != 0 || cmd != nil {
@@ -616,7 +617,7 @@ func TestPaletteRefreshFlippingStopToRunRunsNothing(t *testing.T) {
 func TestPaletteSelectionVanishingRunsNothing(t *testing.T) {
 	m, sp := newSpied(t, "full")
 	m, _ = feed(m, key(tea.KeyDown)) // beta, offers Run
-	m, _ = feed(m, typeText(":p")...)
+	m, _ = feed(m, typeText(">p")...)
 	// beta vanishes; selection moves to a sibling that also offers Run.
 	m, _ = feed(m, snapshotWith(map[string][]Action{"epsilon": {ActionRun, ActionOpenFolder}}, "beta", "gamma", "delta"))
 	if r := m.selectedRow(); r == nil || r.instance.Key == "beta" {
@@ -636,7 +637,7 @@ func TestPaletteSelectionVanishingRunsNothing(t *testing.T) {
 func TestPaletteSurvivesUnrelatedRefresh(t *testing.T) {
 	m, sp := newSpied(t, "full")
 	m, _ = feed(m, key(tea.KeyDown)) // beta
-	m, _ = feed(m, typeText(":run")...)
+	m, _ = feed(m, typeText(">run")...)
 	m, _ = feed(m, snapshotWith(nil, "epsilon"))
 	m, _ = feed(m, key(tea.KeyEnter))
 	if len(sp.calls) != 1 || sp.calls[0].Action != ActionRun || sp.calls[0].InstanceKey != "beta" {
@@ -644,13 +645,13 @@ func TestPaletteSurvivesUnrelatedRefresh(t *testing.T) {
 	}
 }
 
-// Case (c): a sentence typed into the wrong pane, with a colon in it, then
-// Enter. Nothing may reach the handler, whatever words follow the colon.
+// Case (c): a sentence typed into the wrong pane, with the palette key (">") in it, then
+// Enter. Nothing may reach the handler, whatever words follow the ">".
 func TestSentencesNeverReachStateChangingActions(t *testing.T) {
 	for _, sentence := range []string{
-		"next: run it", "ok:start", "see: resume", "x: enroll", "note: stopping",
-		"hey: hold on", "so: run it now", "ok: pausing now", "re: replay",
-		"ok: exit", "re: close", "re: reload", "so: rescan",
+		"next> run it", "ok> start", "see> resume", "x> enroll", "note> stopping",
+		"hey> hold on", "so> run it now", "ok> pausing now", "re> replay",
+		"ok> exit", "re> close", "re> reload", "so> rescan",
 	} {
 		m, sp := newSpied(t, "full")
 		for _, row := range []int{0, 1} { // alpha offers Stop, beta offers Run
@@ -674,16 +675,16 @@ func TestSentencesNeverReachStateChangingActions(t *testing.T) {
 	}
 }
 
-// What a sentence can still reach is an exact name prefix after a colon, and
-// the short forms stay usable: ":q", ":quit" and ":r" then Enter.
+// What a sentence can still reach is an exact name prefix after a ">", and
+// the short forms stay usable: ">q", ">quit" and ">r" then Enter.
 func TestExactNamePrefixesStillQuitAndRefresh(t *testing.T) {
 	for query, want := range map[string]Action{
 		"q": ActionQuit, "quit": ActionQuit, "r": ActionRefresh, "refresh": ActionRefresh,
-		"q: quit": ActionQuit, // a sentence ending in the exact name still gets there
+		"q> quit": ActionQuit, // a sentence ending in the exact name still gets there
 	} {
 		m, sp := newSpied(t, "full")
-		text := ":" + query
-		if strings.Contains(query, ":") {
+		text := ">" + query
+		if strings.Contains(query, ">") {
 			text = query
 		}
 		m, cmd := feed(m, append(typeText(text), key(tea.KeyEnter))...)
@@ -715,7 +716,7 @@ func TestStopIsFoundByItsNamePrefixAndNoAlias(t *testing.T) {
 		"s": true, "st": true, "sto": true, "stop": true, "STOP": true,
 		"pause": false, "halt": false, "end": false, "release": false, "top": false, "sp": false, "pa": false, "play": false,
 	} {
-		mm, _ := feed(m, append([]tea.Msg{}, typeText(":"+query)...)...)
+		mm, _ := feed(m, append([]tea.Msg{}, typeText(">"+query)...)...)
 		got := false
 		for _, c := range mm.filtered() {
 			got = got || c.action == ActionStop
@@ -733,7 +734,7 @@ func TestStopIsFoundByItsNamePrefixAndNoAlias(t *testing.T) {
 		t.Errorf("beta offers %s", got)
 	}
 	for _, q := range []string{"play", "pause"} {
-		mm, _ := feed(m, append([]tea.Msg{}, typeText(":"+q)...)...)
+		mm, _ := feed(m, append([]tea.Msg{}, typeText(">"+q)...)...)
 		for _, c := range mm.filtered() {
 			if c.action == ActionRun || c.action == ActionStop {
 				t.Errorf("%q still finds %s", q, c.name)
@@ -769,7 +770,7 @@ func TestRAndReFindRefreshFirstAndRunNeedsRu(t *testing.T) {
 			for i := 0; i < row; i++ {
 				m, _ = feed(m, key(tea.KeyDown))
 			}
-			m, _ = feed(m, append(typeText(":"+query), key(tea.KeyEnter))...)
+			m, _ = feed(m, append(typeText(">"+query), key(tea.KeyEnter))...)
 			if len(sp.calls) != 1 || sp.calls[0].Action != want {
 				t.Errorf("row %d, %q then Enter: calls = %v, want only %s", row, query, sp.calls, want)
 			}
@@ -777,18 +778,18 @@ func TestRAndReFindRefreshFirstAndRunNeedsRu(t *testing.T) {
 	}
 	m, _ := newSpied(t, "full")
 	m, _ = feed(m, key(tea.KeyDown)) // beta offers Run
-	m, _ = feed(m, typeText(":r")...)
+	m, _ = feed(m, typeText(">r")...)
 	if top := m.filtered(); len(top) < 2 || top[0].action != ActionRefresh || top[1].action != ActionRun {
-		t.Errorf(`":r" lists %v, want Refresh first, then Run`, top)
+		t.Errorf(`">r" lists %v, want Refresh first, then Run`, top)
 	}
 }
 
-// The name Run is reached the same way: a sentence that ends, after a colon, in
+// The name Run is reached the same way: a sentence that ends, after a ">", in
 // "run" or a prefix of it runs the instance the palette was opened on.
 func TestASentenceEndingInTheExactNameRunsTheInstance(t *testing.T) {
 	m, sp := newSpied(t, "full")
 	m, _ = feed(m, key(tea.KeyDown)) // beta offers Run
-	m, _ = feed(m, append(typeText("next: run"), key(tea.KeyEnter))...)
+	m, _ = feed(m, append(typeText("next> run"), key(tea.KeyEnter))...)
 	if len(sp.calls) != 1 || sp.calls[0].Action != ActionRun || sp.calls[0].InstanceKey != "beta" {
 		t.Fatalf("calls = %v", sp.calls)
 	}
@@ -801,7 +802,7 @@ func TestQuitAndRefreshMatchOnlyTheNamePrefix(t *testing.T) {
 		"exit": nil, "close": nil, "reload": nil, "rescan": nil, "snapshot": nil,
 		"qt": nil, "rf": nil, "q": {ActionQuit}, "re": {ActionRefresh}, "r": {ActionRefresh},
 	} {
-		mm, _ := feed(m, typeText(":"+query)...)
+		mm, _ := feed(m, typeText(">"+query)...)
 		var got []Action
 		for _, c := range mm.filtered() {
 			if c.action == ActionQuit || c.action == ActionRefresh {
@@ -822,7 +823,7 @@ func TestStateChangingActionsMatchOnlyTheNamePrefix(t *testing.T) {
 		"start": false, "enroll": false, "resume": false, "ay": false, "pa": false,
 		"r": true, "ru": true, "run": true, "RUN": true,
 	} {
-		mm, _ := feed(m, append([]tea.Msg{}, typeText(":"+query)...)...)
+		mm, _ := feed(m, append([]tea.Msg{}, typeText(">"+query)...)...)
 		got := false
 		for _, c := range mm.filtered() {
 			got = got || c.action == ActionRun
@@ -836,12 +837,31 @@ func TestStateChangingActionsMatchOnlyTheNamePrefix(t *testing.T) {
 // Moving the cursor follows the action, not the list position.
 func TestPaletteCursorFollowsTheActionAcrossRefresh(t *testing.T) {
 	m, sp := newSpied(t, "full") // alpha: Pause, Open folder
-	m, _ = feed(m, typeText(":")...)
+	m, _ = feed(m, typeText(">")...)
 	m, _ = feed(m, key(tea.KeyDown), key(tea.KeyDown)) // Pause, Open folder
 	// A refresh puts a new action first; position 1 would now be Pause's slot.
 	m, _ = feed(m, snapshotWith(map[string][]Action{"alpha": {ActionRun, ActionStop, ActionOpenFolder}}))
 	m, _ = feed(m, key(tea.KeyEnter))
 	if len(sp.calls) != 1 || sp.calls[0].Action != ActionOpenFolder || sp.calls[0].InstanceKey != "alpha" {
 		t.Fatalf("calls = %#v", sp.calls)
+	}
+}
+
+// The palette opens on ">" alone (the same key as tireless-watcher's and the
+// other easy apps'); ":" no longer opens it, and ">" typed into the open
+// palette's query is text, not a second opening.
+func TestPaletteOpensOnGreaterThanAndKeepsItAsText(t *testing.T) {
+	m, _ := newSpied(t, "full")
+	colon, _ := feed(m, typeText(":")...)
+	if colon.palette != nil {
+		t.Fatalf("\":\" opened the palette")
+	}
+	open, _ := feed(m, typeText(">")...)
+	if open.palette == nil {
+		t.Fatalf("\">\" did not open the palette")
+	}
+	typed, _ := feed(open, typeText("a>b")...)
+	if typed.palette == nil || typed.palette.query != "a>b" {
+		t.Fatalf("query after typing \"a>b\" = %+v", typed.palette)
 	}
 }

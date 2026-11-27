@@ -10,6 +10,7 @@ import (
 
 	"github.com/zealtv/easyhog/internal/core"
 	"github.com/zealtv/easyhog/internal/groundhog"
+	"github.com/zealtv/easyhog/internal/twglance"
 )
 
 // State says what an instance or schedule item is doing, in words and a glyph
@@ -229,6 +230,12 @@ type Data struct {
 	Err string
 	// Note explains an empty tree when there is no error.
 	Note string
+	// Pane is what Easyhog's own tmux pane reports to tireless-watcher's map
+	// (panereport.go).
+	Pane PaneReport
+	// Glance is what the map draws of Easyhog inside its own pane's box: the
+	// badge line and the ticked instances (glance.go).
+	Glance twglance.Glance
 }
 
 // SnapshotMsg replaces the shown data. Selection, expansion and scroll follow

@@ -393,7 +393,7 @@ func TestOpenFolderRunsOnlyThroughThePaletteOnTheBoundInstance(t *testing.T) {
 		t.Fatalf("a bare key opened %v", opened)
 	}
 	m, _ = update(m, key(tea.KeyTab), key(tea.KeyDown)) // instance b
-	m, _ = update(m, typeText(":open folder")...)
+	m, _ = update(m, typeText(">open folder")...)
 	var msgs []tea.Msg
 	m, msgs = update(m, key(tea.KeyEnter))
 	if len(opened) != 1 || opened[0] != "/r/b/.groundhog" {
@@ -408,7 +408,7 @@ func TestOpenFolderRunsOnlyThroughThePaletteOnTheBoundInstance(t *testing.T) {
 	}
 
 	// The selection moving or vanishing while the palette is open opens nothing.
-	m, _ = update(m, typeText(":open")...)
+	m, _ = update(m, typeText(">open")...)
 	m, _ = update(m, SnapshotMsg{FromView(viewOf("a"))})
 	m, msgs = update(m, key(tea.KeyEnter))
 	if len(opened) != 1 {
@@ -426,7 +426,7 @@ func TestOpenFolderRunsOnlyThroughThePaletteOnTheBoundInstance(t *testing.T) {
 
 func TestOpenFolderReportsAFailureAndIsOfferedForEveryKindOfInstance(t *testing.T) {
 	m := NewWithData(FromView(viewOf("a")), WithFolderOpener(func(string) error { return errors.New("the folder is gone") }))
-	m, _ = update(m, typeText(":open")...)
+	m, _ = update(m, typeText(">open")...)
 	m, msgs := update(m, key(tea.KeyEnter))
 	if r, ok := msgs[0].(ResultMsg); !ok || r.Err == nil {
 		t.Fatalf("%+v", msgs)
@@ -446,7 +446,7 @@ func TestOpenFolderReportsAFailureAndIsOfferedForEveryKindOfInstance(t *testing.
 
 func TestWithoutAnOpenerOpenFolderStillReportsNotAvailable(t *testing.T) {
 	m := NewWithData(FromView(viewOf("a")))
-	m, _ = update(m, typeText(":open")...)
+	m, _ = update(m, typeText(">open")...)
 	_, msgs := update(m, key(tea.KeyEnter))
 	if r, ok := msgs[0].(ResultMsg); !ok || !errors.Is(r.Err, ErrNotAvailable) {
 		t.Fatalf("%+v", msgs)

@@ -33,6 +33,12 @@ const (
 	// calls). Half the client's default: a status that takes this long is itself
 	// the finding to show.
 	DefaultCallTimeout = 15 * time.Second
+	// DefaultRereadEvery is how often the refresher re-reads, in the
+	// background, each instance the reader has already had inspected this
+	// session (chose in the tree, or reached with Refresh) and has not
+	// selected now: so an instance an agent ticks for itself, or one this
+	// session ticks, shows what it is doing without being selected again.
+	DefaultRereadEvery = time.Minute
 	// DefaultConcurrency bounds simultaneous script calls, which only an
 	// explicit Refresh over many instances approaches.
 	DefaultConcurrency = 4
@@ -63,6 +69,9 @@ type Config struct {
 	DiscoverEvery time.Duration
 	CallTimeout   time.Duration
 	Concurrency   int
+	// RereadEvery is the background re-read period (DefaultRereadEvery when
+	// zero); a negative value turns the re-read off.
+	RereadEvery time.Duration
 }
 
 func (c *Config) fill() {
@@ -84,18 +93,24 @@ func (c *Config) fill() {
 	if c.Concurrency <= 0 {
 		c.Concurrency = DefaultConcurrency
 	}
+	if c.RereadEvery == 0 {
+		c.RereadEvery = DefaultRereadEvery
+	}
 }
 
 // Refresher keeps a cache of what is known about each discovered instance and
 // refreshes it off the caller's goroutine.
 //
 // Which scripts run is the reader's decision:
-//   - Background and periodic refresh run `capabilities --json` and
-//     `status --json` only for the selected instance.
+//   - Periodic refresh runs `capabilities --json` and `status --json` for the
+//     selected instance.
 //   - An explicit Refresh, the reader's deliberate act, runs them for every
 //     discovered, well-formed instance.
+//   - About once a minute (RereadEvery), the background re-read runs them
+//     again for each instance the reader has already had inspected this
+//     session (chosen, or reached by Refresh) and has not selected now.
 //   - Every other instance is shown from directory listings (discovery.Glance),
-//     marked not inspected, or with the time it was last inspected.
+//     marked not inspected.
 //
 // A Refresher is safe for concurrent use. Run must be called once.
 type Refresher struct {
@@ -117,6 +132,7 @@ type Refresher struct {
 	selectedAt time.Time // when it became selected, by the refresher's clock
 	selSeq     int
 	refreshQ   bool
+	rereadKey  string          // the instance rereadNext started last
 	ectx       context.Context // Run's context; cancelled when Run ends
 	wg         sync.WaitGroup
 }
@@ -131,9 +147,14 @@ type entry struct {
 	busy          bool
 	rerun         bool // an explicit refresh arrived while busy
 	attempted     bool
-	fails         int
-	lastDur       time.Duration
-	nextAfter     time.Time
+	// chosen: a read started for it because the reader chose it or asked for
+	// it (selection, Refresh, an action), so the background re-read may read it
+	// again. It stays set for the session.
+	chosen    bool
+	lastStart time.Time // when the newest read of it started
+	fails     int
+	lastDur   time.Duration
+	nextAfter time.Time
 }
 
 // NewRefresher builds a refresher. It starts nothing.
@@ -271,6 +292,7 @@ func (r *Refresher) Run(ctx context.Context) error {
 		case <-poll:
 			poll = clk.After(r.cfg.Interval)
 			r.pollSelected()
+			r.rereadNext()
 			r.signalSelectedAge()
 		case <-rescan:
 			rescan = clk.After(r.cfg.DiscoverEvery)
@@ -302,6 +324,47 @@ func (r *Refresher) explicit(ctx context.Context) {
 	r.mu.Unlock()
 	for _, e := range list {
 		r.start(e, true)
+	}
+}
+
+// rereadNext starts the background re-read of one instance the reader has had
+// inspected this session, other than the selected one (pollSelected keeps
+// that), when its last read began a period ago (RereadEvery, spaced further
+// after failures): the one waiting longest, and none while the last one it
+// started is still going. It runs on the poll, so the reads spread out
+// instead of arriving together, and it only reads status: an instance whose
+// capabilities were never answered waits for the reader.
+func (r *Refresher) rereadNext() {
+	if r.cfg.RereadEvery <= 0 {
+		return
+	}
+	now := r.cfg.Clock.Now()
+	r.mu.Lock()
+	if e := r.entries[r.rereadKey]; e != nil && e.busy {
+		r.mu.Unlock()
+		return
+	}
+	var next *entry
+	key := ""
+	for _, k := range r.order {
+		e := r.entries[k]
+		if e == nil || !e.chosen || k == r.selected || e.busy || len(e.inst.Malformed) > 0 {
+			continue
+		}
+		if e.insp.Support == nil || !e.insp.Support.Inspectable {
+			continue // never answered capabilities, or legacy: nothing to re-read
+		}
+		if now.Before(e.nextAfter) || now.Before(e.lastStart.Add(r.cfg.RereadEvery<<min(e.fails, 3))) {
+			continue
+		}
+		if next == nil || e.lastStart.Before(next.lastStart) {
+			next, key = e, k
+		}
+	}
+	r.rereadKey = key
+	r.mu.Unlock()
+	if next != nil {
+		r.start(next, false)
 	}
 }
 
@@ -343,6 +406,8 @@ func (r *Refresher) start(e *entry, explicit bool) {
 		return
 	}
 	e.busy = true
+	e.chosen = true
+	e.lastStart = r.cfg.Clock.Now()
 	r.mu.Unlock()
 	if !r.spawn(func(ctx context.Context) { r.inspect(ctx, e, explicit) }) {
 		r.mu.Lock()

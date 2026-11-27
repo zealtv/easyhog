@@ -14,7 +14,7 @@ func TestPaletteOverlayLeavesNoFragmentsBesideTheBox(t *testing.T) {
 	for _, size := range [][2]int{{100, 30}, {120, 40}, {80, 24}, {64, 20}} {
 		r := newRig(t, &fakeControl{})
 		r.send(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
-		r.send(typeText(":pl")...)
+		r.send(typeText(">pl")...)
 		lines := strings.Split(r.screen(), "\n")
 		top, bottom := -1, -1
 		for i, l := range lines {

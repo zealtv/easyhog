@@ -71,7 +71,7 @@ func TestEveryPlaceTheInstanceLabelShowsDropsTheSuffix(t *testing.T) {
 		t.Errorf("preview header %q", head)
 	}
 
-	pal, _ := feed(m, typeText(":")[0])
+	pal, _ := feed(m, typeText(">")[0])
 	if out := ansi.Strip(pal.View()); !strings.Contains(out, "on alpha") || strings.Contains(out, "on alpha/") {
 		t.Errorf("palette label:\n%s", out)
 	}
@@ -93,7 +93,7 @@ func TestRootThatIsAProjectOrTheInstanceShowsTheProjectName(t *testing.T) {
 		if !strings.Contains(screen, "❯   ○ myproj ") {
 			t.Errorf("Display %q: tree row does not read myproj:\n%s", display, screen)
 		}
-		pal, _ := feed(m, typeText(":")[0])
+		pal, _ := feed(m, typeText(">")[0])
 		if out := ansi.Strip(pal.View()); !strings.Contains(out, "on myproj") {
 			t.Errorf("Display %q: palette does not name myproj:\n%s", display, out)
 		}

@@ -224,7 +224,7 @@ func TestPaletteListsAndRunsPauseItemAndUnpauseItem(t *testing.T) {
 	if r.names() != "Run,Pause item,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("a scheduled item offers %s", r.names())
 	}
-	r.send(typeText(":pause")...)
+	r.send(typeText(">pause")...)
 	if !strings.Contains(r.screen(), "Pause item") || !strings.Contains(r.screen(), "→ foo.paused") {
 		t.Fatalf("the palette row lacks its note:\n%s", r.screen())
 	}
@@ -265,7 +265,7 @@ func TestPaletteListsAndRunsPauseItemAndUnpauseItem(t *testing.T) {
 	f2 := &fakeControl{}
 	r.m.control = f2
 	r.m.handler = controlHandler(func(ActionRequest) tea.Cmd { return nil }, f2, nil)
-	msgs := r.send(append(typeText(":unpause"), key(tea.KeyEnter))...)
+	msgs := r.send(append(typeText(">unpause"), key(tea.KeyEnter))...)
 	r.send(msgs...)
 	if len(f2.toggleCalls()) != 1 || f2.toggleCalls()[0] != "item alpha "+fooPaused+" false" {
 		t.Fatalf("calls %v", f2.toggleCalls())
@@ -306,7 +306,7 @@ func TestToggleActionsMatchOnlyTheNamePrefix(t *testing.T) {
 	}
 	for _, c := range cases {
 		r := toggleRig(t, &fakeControl{}, c.v)
-		mm, _ := feed(r.m, typeText(":"+c.query)...)
+		mm, _ := feed(r.m, typeText(">"+c.query)...)
 		var got Action
 		for _, m := range mm.filtered() {
 			if m.action.togglesItem() {
@@ -317,9 +317,9 @@ func TestToggleActionsMatchOnlyTheNamePrefix(t *testing.T) {
 			t.Errorf("query %q finds %q, want %q", c.query, got, c.want)
 		}
 	}
-	// ":r" and ":re" stay Refresh and ":p" never reaches Run.
+	// ">r" and ">re" stay Refresh and ">p" never reaches Run.
 	r := toggleRig(t, &fakeControl{}, withItems(supported("a"), plainItem(foo)))
-	r.send(append(typeText(":re"), key(tea.KeyEnter))...)
+	r.send(append(typeText(">re"), key(tea.KeyEnter))...)
 	if len(r.f.toggleCalls()) != 0 {
 		t.Errorf("a toggle ran: %v", r.f.toggleCalls())
 	}
@@ -327,8 +327,8 @@ func TestToggleActionsMatchOnlyTheNamePrefix(t *testing.T) {
 
 func TestSentencesAndBareKeysNeverReachPauseItem(t *testing.T) {
 	for _, sentence := range []string{
-		"so: hold that", "see: unpause all", "x: resume", "hey: please pause this",
-		"p", "u", "pause item", "unpause item", " pause", "so: suspend", "y: paused", "z: unpaused", "ok: pausing", "so: pause the report",
+		"so> hold that", "see> unpause all", "x> resume", "hey> please pause this",
+		"p", "u", "pause item", "unpause item", " pause", "so> suspend", "y> paused", "z> unpaused", "ok> pausing", "so> pause the report",
 	} {
 		for _, v := range []core.InstanceView{
 			withItems(supported("alpha"), plainItem(foo)),
@@ -346,14 +346,14 @@ func TestSentencesAndBareKeysNeverReachPauseItem(t *testing.T) {
 		}
 	}
 	// What a sentence can still reach is what it can reach for Run and Quit: an
-	// exact name prefix after a colon, which opens the palette there and runs on
+	// exact name prefix after a ">", which opens the palette there and runs on
 	// Enter.
 	f := &fakeControl{}
 	r := toggleRig(t, f, withItems(supported("alpha"), plainItem(foo)))
-	msgs := r.send(append(typeText("note: pause"), key(tea.KeyEnter))...)
+	msgs := r.send(append(typeText("note> pause"), key(tea.KeyEnter))...)
 	r.send(msgs...)
 	if len(f.toggleCalls()) != 1 {
-		t.Fatalf("an exact name after a colon: %v", f.toggleCalls())
+		t.Fatalf("an exact name after a \">\": %v", f.toggleCalls())
 	}
 }
 
@@ -361,7 +361,7 @@ func TestToggleRunsOnlyOnTheRowAndOfferThePaletteOpenedOn(t *testing.T) {
 	two := withItems(supported("alpha"), plainItem("schedule/daily/a"), plainItem(foo))
 	f := &fakeControl{}
 	r := toggleRig(t, f, two) // selected: a
-	r.send(typeText(":pause")...)
+	r.send(typeText(">pause")...)
 	// Behind the open palette a snapshot moves the selection (a is gone).
 	r.send(SnapshotMsg{Data: r.data(withItems(supported("alpha"), plainItem(foo)))})
 	r.send(key(tea.KeyEnter))
@@ -375,7 +375,7 @@ func TestToggleRunsOnlyOnTheRowAndOfferThePaletteOpenedOn(t *testing.T) {
 	// The item was paused elsewhere meanwhile: Pause item is no longer offered.
 	f = &fakeControl{}
 	r = toggleRig(t, f, withItems(supported("alpha"), plainItem(foo)))
-	r.send(typeText(":pause")...)
+	r.send(typeText(">pause")...)
 	r.send(SnapshotMsg{Data: r.data(withItems(supported("alpha"), ownPause(plainItem(fooPaused))))})
 	r.send(key(tea.KeyEnter))
 	if len(f.toggleCalls()) != 0 || !r.m.failure || !strings.Contains(r.m.notice, "Nothing ran: Pause item is no longer offered") {
@@ -426,7 +426,7 @@ func TestToggleRefusalShowsAsAFailureAndRereads(t *testing.T) {
 		return core.ItemResult{}, &core.RefusedError{Op: "pause-item", Instance: key, Reason: core.RefusedNotOffered, Detail: "paused through schedule/weekly.paused, not by its own name"}
 	}}
 	r := toggleRig(t, f, withItems(supported("alpha"), plainItem(foo)))
-	msgs := r.send(append(typeText(":pause"), key(tea.KeyEnter))...)
+	msgs := r.send(append(typeText(">pause"), key(tea.KeyEnter))...)
 	r.send(msgs...)
 	if !r.m.failure || !strings.Contains(r.m.notice, "refused: not offered: paused through") || len(r.reread) != 1 || len(r.m.busy) != 0 {
 		t.Fatalf("notice %q failure %v reread %v busy %v", r.m.notice, r.m.failure, r.reread, r.m.busy)

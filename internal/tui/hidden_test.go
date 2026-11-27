@@ -55,18 +55,21 @@ func TestHiddenInstancesAreLeftOutByDefaultAndCounted(t *testing.T) {
 	if !strings.Contains(v, "2 hidden (malformed, legacy or unsupported)") {
 		t.Fatalf("status line lacks the count:\n%s", v)
 	}
+	if !strings.Contains(v, "> then \"show\" lists them") {
+		t.Fatalf("status line does not name the palette key:\n%s", v)
+	}
 }
 
 func TestPaletteTogglesHiddenInstances(t *testing.T) {
 	m, sp, _ := hiddenModel(t)
 	for _, word := range []string{"hidden", "show"} {
-		m2, _ := feed(m, typeText(":"+word)...)
+		m2, _ := feed(m, typeText(">"+word)...)
 		got := m2.filtered()
 		if len(got) == 0 || got[0].action != ActionToggleHidden || got[0].name != "Show hidden instances" {
 			t.Fatalf("typing %q finds %v", word, got)
 		}
 	}
-	m, cmd := feed(m, append(typeText(":hidden"), key(tea.KeyEnter))...)
+	m, cmd := feed(m, append(typeText(">hidden"), key(tea.KeyEnter))...)
 	if cmd != nil || len(sp.calls) != 0 {
 		t.Fatal("the toggle is a view action: it must start no work and reach no handler")
 	}
@@ -76,7 +79,7 @@ func TestPaletteTogglesHiddenInstances(t *testing.T) {
 	if !strings.Contains(m.View(), "2 hidden, shown") {
 		t.Fatalf("header does not say they are shown:\n%s", m.View())
 	}
-	m, _ = feed(m, typeText(":hide")...)
+	m, _ = feed(m, typeText(">hide")...)
 	if got := m.filtered(); len(got) == 0 || got[0].name != "Hide unsupported instances" {
 		t.Fatalf("while shown the action offers hiding: %v", got)
 	}
@@ -119,13 +122,13 @@ func TestBareKeysNeverToggleHidden(t *testing.T) {
 
 func TestSelectionMovesToAVisibleNeighbourWhenItsInstanceHides(t *testing.T) {
 	m, _, reported := hiddenModel(t)
-	m, _ = feed(m, append(typeText(":hidden"), key(tea.KeyEnter))...) // show them
+	m, _ = feed(m, append(typeText(">hidden"), key(tea.KeyEnter))...) // show them
 	m, _ = feed(m, key(tea.KeyDown), key(tea.KeyDown))                // alpha, beta, gamma
 	if m.selectedKey() != "gamma" {
 		t.Fatalf("selected %s", m.selectedKey())
 	}
 	*reported = nil
-	m, cmd := feed(m, append(typeText(":hide"), key(tea.KeyEnter))...)
+	m, cmd := feed(m, append(typeText(">hide"), key(tea.KeyEnter))...)
 	runCmd(cmd)
 	if k := m.selectedKey(); k != "delta" {
 		t.Fatalf("highlight on %q, want the next visible neighbour", k)
@@ -145,14 +148,14 @@ func TestSelectionUnderAHiddenInstanceMoves(t *testing.T) {
 	var reported []string
 	m := NewWithData(d, WithSelectionObserver(func(k string) { reported = append(reported, k) }))
 	m, _ = feed(m, tea.WindowSizeMsg{Width: 100, Height: 30})
-	m, _ = feed(m, append(typeText(":hidden"), key(tea.KeyEnter))...)
+	m, _ = feed(m, append(typeText(">hidden"), key(tea.KeyEnter))...)
 	m = m.setExpanded("gamma", true)
 	m, _ = feed(m, key(tea.KeyDown), key(tea.KeyDown), key(tea.KeyDown))
 	if m.selectedKey() != "gamma/x" {
 		t.Fatalf("selected %s", m.selectedKey())
 	}
 	reported = nil
-	m, cmd := feed(m, append(typeText(":hide"), key(tea.KeyEnter))...)
+	m, cmd := feed(m, append(typeText(">hide"), key(tea.KeyEnter))...)
 	runCmd(cmd)
 	if m.selectedKey() != "delta" || !reportsNoInstance(reported) {
 		t.Fatalf("selected %q, reported %v", m.selectedKey(), reported)
@@ -209,7 +212,7 @@ func TestEmptyVisibleTreeSaysHowToShowHiddenInstances(t *testing.T) {
 	if m.selectedKey() != "" {
 		t.Fatal("nothing should be selected")
 	}
-	m, _ = feed(m, append(typeText(":show"), key(tea.KeyEnter))...)
+	m, _ = feed(m, append(typeText(">show"), key(tea.KeyEnter))...)
 	if m.selectedKey() == "" || len(m.rows) != 6 {
 		t.Fatalf("showing did not restore the tree: %v", rowKeys(m))
 	}
@@ -232,21 +235,21 @@ func TestAdapterHidesByClassOnly(t *testing.T) {
 func TestTypingRunDoesNotFindTheToggle(t *testing.T) {
 	m, _, _ := hiddenModel(t)
 	for _, q := range []string{"run", "stop", "ply"} {
-		m2, _ := feed(m, typeText(":"+q)...)
+		m2, _ := feed(m, typeText(">"+q)...)
 		for _, c := range m2.filtered() {
 			if c.action == ActionToggleHidden {
 				t.Errorf("typing %q found the toggle", q)
 			}
 		}
 	}
-	m2, _ := feed(m, typeText(":uns")...)
+	m2, _ := feed(m, typeText(">uns")...)
 	if got := m2.filtered(); len(got) != 1 || got[0].action != ActionToggleHidden {
 		t.Errorf("typing uns finds %v", got)
 	}
 	// Either state of the toggle answers to both words.
-	m3, _ := feed(m, append(typeText(":hidden"), key(tea.KeyEnter))...)
+	m3, _ := feed(m, append(typeText(">hidden"), key(tea.KeyEnter))...)
 	for _, q := range []string{"hidden", "show", "hide"} {
-		m4, _ := feed(m3, typeText(":"+q)...)
+		m4, _ := feed(m3, typeText(">"+q)...)
 		if got := m4.filtered(); len(got) == 0 || got[0].action != ActionToggleHidden {
 			t.Errorf("while shown, typing %q finds %v", q, got)
 		}

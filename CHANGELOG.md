@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.3.0 (2026-11-27)
+
+Easyhog reports what it sees to a map of tmux windows, and its palette moves to `>`.
+
+- `>` opens the command palette, as in the other easy tools; `:` no longer does.
+- Inside tmux, Easyhog keeps options on its own pane for a map of windows, and unsets them on Quit:
+  - `@tw-focus`: where the instance list is, so a small live preview of the pane shows the list;
+  - `@tw-next`: the next wake among the instances it ticks (`report at 10:30 · alpha`);
+  - `@tw_status` `fail`, with the reason in `@tw_status_text`, while one of their wakes has failed;
+  - a glance: `@tw-glance-far`, a badge line of instances it ticks, ticked from outside and failed,
+    and `@tw-glance-mid`, one row per ticked instance.
+- Instances you have already opened this session are re-read about once a minute, so one ticked from
+  outside, or one this session ticks but isn't showing, stays current. An instance never opened is
+  still never run.
+
 ## v0.2.0 (2026-11-20)
 
 Easyhog moves to Groundhog's runtime protocol 2, in which a schedule item can carry its own executable

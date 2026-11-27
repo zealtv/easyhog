@@ -143,7 +143,7 @@ func (e *e2e) settle(what string, cond func(core.InstanceView) bool) {
 
 func (e *e2e) palette(command string) {
 	e.t.Helper()
-	e.send(typeText(":" + command)...)
+	e.send(typeText(">" + command)...)
 	e.send(key(tea.KeyEnter))
 }
 
@@ -223,7 +223,7 @@ func TestEndToEndRunPauseStopRunQuitOnATempInstance(t *testing.T) {
 	}
 
 	// Quit: the palette ends the shell, and main then stops every loop.
-	e.send(typeText(":quit")...)
+	e.send(typeText(">quit")...)
 	if _, cmd := e.m.Update(key(tea.KeyEnter)); !quits(cmd) {
 		t.Fatal("palette Quit did not quit")
 	}

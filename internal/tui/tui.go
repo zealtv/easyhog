@@ -5,7 +5,7 @@
 //
 // Key safety is the core rule. Arrows, Tab and scroll keys only inspect, and
 // Enter may inspect. Bare letters, Space, Enter and mouse clicks never start,
-// stop or quit anything. ":" opens the palette; Quit and every action live
+// stop or quit anything. ">" opens the palette; Quit and every action live
 // only there. ctrl+c is the one chord that always exits.
 package tui
 
@@ -13,11 +13,16 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/zealtv/easyhog/internal/twfocus"
+	"github.com/zealtv/easyhog/internal/twglance"
+	"github.com/zealtv/easyhog/internal/twpane"
 )
 
 type pane int
@@ -29,6 +34,18 @@ const (
 
 // Model is the Bubble Tea model for the shell.
 type Model struct {
+	// twFocus tells a pane previewer where the instance list is (twfocus). Only
+	// RunLive gives it a pane, so tests and one-frame output report nothing.
+	twFocus twfocus.Pane
+	// pane keeps the map's other options on this program's pane: the next wake
+	// and a failed one (twpane, panereport.go). Like twFocus, only RunLive
+	// gives it a pane; paneFail is the failure it reports and since when.
+	pane twpane.Pane
+	// glance draws Easyhog's badge line and ticked instances in its box on the
+	// map (twglance, glance.go). Only RunLive gives it a pane.
+	glance   twglance.Pane
+	paneFail paneFailure
+
 	data    Data
 	handler ActionHandler
 	styles  styles
@@ -320,7 +337,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		nm, pc = nm.wantPayload(key != beforeKey)
 		cmd = tea.Batch(cmd, pc)
 	}
+	if f := nm.twFocus.Report(nm.focusRect()); f != nil {
+		cmd = tea.Batch(cmd, f)
+	}
+	nm.updatePaneFail()
+	if p := nm.pane.Sync(nm.paneValues()); p != nil {
+		cmd = tea.Batch(cmd, p)
+	}
+	if g := nm.glance.Sync(nm.data.Glance); g != nil {
+		cmd = tea.Batch(cmd, g)
+	}
 	return nm, cmd
+}
+
+// focusRect is the part of the screen a small preview should show: the instance
+// tree, running and stopped alike, from its top. With the tree not on screen (one
+// pane at a time, the preview's turn) it names nothing.
+func (m Model) focusRect() twfocus.Rect {
+	l := m.layout()
+	if !l.showTree || l.tree.w < 1 || l.tree.h < 1 {
+		return twfocus.Rect{}
+	}
+	return twfocus.Rect{X: l.tree.x, Y: l.tree.y, W: l.tree.w, H: l.tree.h}
 }
 
 // readerMoves reports whether msg is the reader acting on the tree: a key press
@@ -720,6 +758,12 @@ func RunLive(ctx context.Context, model Model, input io.Reader, output io.Writer
 	}
 	// The starting selection is not reported: no script runs until the reader's
 	// first key press that selects or moves (see WithSelectionObserver).
+	model.twFocus.ID = os.Getenv("TMUX_PANE")
+	if os.Getenv("TMUX") != "" {
+		model.pane = twpane.New(os.Getenv("TMUX_PANE"))
+		model.glance = twglance.New(os.Getenv("TMUX_PANE"))
+	}
+	defer func() { _ = model.pane.Clear(); _ = model.glance.Clear() }()
 	p := tea.NewProgram(model, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(output),
 		tea.WithAltScreen(), tea.WithMouseCellMotion())
 	stop := make(chan struct{})

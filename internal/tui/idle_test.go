@@ -112,7 +112,7 @@ func (r *idleRig) eventually(what string, cond func() bool) {
 func TestIdleStartRunsNoScriptAndTheFirstArrowKeyDoes(t *testing.T) {
 	r := newIdleRig(t, "a", "b")
 	r.idle(300 * time.Millisecond) // many times the settle delay and the interval
-	r.send(typeText(":")...)
+	r.send(typeText(">")...)
 	r.send(key(tea.KeyEsc))
 	r.send(key(tea.KeyTab), key(tea.KeyTab), key(tea.KeyRight), key(tea.KeyLeft)) // not selecting keys
 	r.idle(100 * time.Millisecond)
@@ -149,7 +149,7 @@ func TestRefreshRunsScriptsWithoutAKeyPress(t *testing.T) {
 	if n := r.log.count(); n != 0 {
 		t.Fatalf("%d script calls at startup", n)
 	}
-	r.send(typeText(":refresh")...)
+	r.send(typeText(">refresh")...)
 	r.send(key(tea.KeyEnter))
 	r.eventually("Refresh to read both instances", func() bool {
 		seen := map[string]bool{}

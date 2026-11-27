@@ -243,7 +243,7 @@ func (r *rig) send(msgs ...tea.Msg) []tea.Msg {
 // result back, and returns the notice.
 func (r *rig) do(query string) string {
 	r.t.Helper()
-	r.send(typeText(":" + query)...)
+	r.send(typeText(">" + query)...)
 	r.send(r.send(key(tea.KeyEnter))...)
 	return r.m.notice
 }
@@ -262,7 +262,7 @@ func (r *rig) names() string {
 // path, and keeps naming it however the selection moves afterwards.
 func TestPalettePromptNamesTheBoundInstance(t *testing.T) {
 	r := newRig(t, &fakeControl{})
-	r.send(typeText(":")...)
+	r.send(typeText(">")...)
 	line := ""
 	for _, l := range strings.Split(r.screen(), "\n") {
 		if strings.Contains(l, "type a command") {
@@ -272,12 +272,12 @@ func TestPalettePromptNamesTheBoundInstance(t *testing.T) {
 	if !strings.Contains(line, "on alpha") {
 		t.Fatalf("the name is not on the prompt line: %q", line)
 	}
-	r.send(key(tea.KeyEsc), key(tea.KeyDown), typeText(":")[0])
+	r.send(key(tea.KeyEsc), key(tea.KeyDown), typeText(">")[0])
 	if !strings.Contains(r.screen(), "on bravo") || strings.Contains(r.screen(), "on alpha") {
 		t.Fatalf("prompt after moving:\n%s", r.screen())
 	}
 	empty := NewWithData(Data{Root: "/r"})
-	empty, _ = feed(empty, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(":")[0])
+	empty, _ = feed(empty, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(">")[0])
 	if strings.Contains(ansi.Strip(empty.View()), " on ") {
 		t.Errorf("an empty list names an instance:\n%s", ansi.Strip(empty.View()))
 	}
@@ -287,7 +287,7 @@ func TestPalettePromptKeepsTheEndOfALongPathAndTheQuery(t *testing.T) {
 	v := supported("x")
 	v.Instance.Display = strings.Repeat("deep/", 12) + "project/.groundhog"
 	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks()), WithControl(&fakeControl{}, nil))
-	m, _ = feed(m, tea.WindowSizeMsg{Width: 60, Height: 24}, typeText(":pla")[0], typeText("pla")[0], typeText("pla")[1], typeText("pla")[2])
+	m, _ = feed(m, tea.WindowSizeMsg{Width: 60, Height: 24}, typeText(">pla")[0], typeText("pla")[0], typeText("pla")[1], typeText("pla")[2])
 	out := ansi.Strip(m.View())
 	if !strings.Contains(out, "project") || !strings.Contains(out, "pla▌") {
 		t.Fatalf("long path or query lost:\n%s", out)
@@ -304,7 +304,7 @@ func TestPalettePromptNameIsInert(t *testing.T) {
 	v := supported("x")
 	v.Instance.Display = "evil\x1b[2J\x07dir/.groundhog"
 	m := NewWithData(FromViewWith(core.View{Instances: []core.InstanceView{v}}, ticks()))
-	m, _ = feed(m, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(":")[0])
+	m, _ = feed(m, tea.WindowSizeMsg{Width: 100, Height: 30}, typeText(">")[0])
 	if out := m.View(); strings.Contains(out, "\x1b[2J") || strings.Contains(out, "\x07") {
 		t.Fatal("control sequence reached the frame")
 	}
@@ -319,7 +319,7 @@ func TestRunShowsTransitionThenOutcomeAndDoesNotQueueASecond(t *testing.T) {
 	if r.names() != "Run,Pause instance,Open folder,Refresh,Quit" {
 		t.Fatalf("alpha offers %s", r.names())
 	}
-	r.send(typeText(":run")...)
+	r.send(typeText(">run")...)
 	next, cmd := r.m.Update(key(tea.KeyEnter))
 	r.m = next.(Model)
 	if cmd == nil || f.list() != "" {
@@ -331,7 +331,7 @@ func TestRunShowsTransitionThenOutcomeAndDoesNotQueueASecond(t *testing.T) {
 	if r.names() != "Open folder,Refresh,Quit" {
 		t.Fatalf("while Run runs the palette offers %s", r.names())
 	}
-	r.send(typeText(":run")...)
+	r.send(typeText(">run")...)
 	if msgs := r.send(key(tea.KeyEnter)); len(msgs) != 0 {
 		t.Fatalf("a second Run scheduled %v", msgs)
 	}
@@ -517,7 +517,7 @@ func TestRefusalShowsAsAFailureAndRereads(t *testing.T) {
 func TestSelectionHoldsDuringARefreshAndAnActionInFlight(t *testing.T) {
 	f := &fakeControl{release: make(chan struct{})}
 	r := newRig(t, f)
-	r.send(typeText(":run")...)
+	r.send(typeText(">run")...)
 	next, cmd := r.m.Update(key(tea.KeyEnter))
 	r.m = next.(Model)
 	alpha, bravo := "/r/alpha/.groundhog", "/r/bravo/.groundhog"
@@ -544,7 +544,7 @@ func TestSelectionHoldsDuringARefreshAndAnActionInFlight(t *testing.T) {
 func TestBoundInstanceSurvivesWhileSomethingIsInFlight(t *testing.T) {
 	f := &fakeControl{}
 	r := newRig(t, f)
-	r.send(typeText(":ru")...)
+	r.send(typeText(">ru")...)
 	r.send(SnapshotMsg{Data: r.data(supported("bravo"))}) // alpha vanishes behind the open palette
 	r.send(key(tea.KeyEnter))
 	if f.list() != "" || !strings.Contains(r.m.notice, "Nothing ran:") {
@@ -557,7 +557,7 @@ func TestBoundInstanceSurvivesWhileSomethingIsInFlight(t *testing.T) {
 func TestQuitDoesNotTouchTheControl(t *testing.T) {
 	f := &fakeControl{}
 	r := newRig(t, f)
-	r.send(typeText(":quit")...)
+	r.send(typeText(">quit")...)
 	if _, cmd := r.m.Update(key(tea.KeyEnter)); !quits(cmd) {
 		t.Fatal("palette Quit did not quit")
 	}
@@ -605,7 +605,7 @@ func TestLongRefusalStaysWholeInThePreview(t *testing.T) {
 		t.Fatalf("bravo's preview shows alpha's outcome:\n%s", whole())
 	}
 	r.send(key(tea.KeyUp))
-	r.send(typeText(":run")...)
+	r.send(typeText(">run")...)
 	r.send(key(tea.KeyEnter)) // its answer has not been fed back: the action is under way
 	if strings.Contains(whole(), "Last action") {
 		t.Fatalf("an old outcome stays while a new action is under way:\n%s", whole())

@@ -37,7 +37,7 @@ func TestPausingAnItemFromThePalette(t *testing.T) {
 	// lists reports whether the palette, searched for query, lists that command's row.
 	lists := func(query, row string) bool {
 		t.Helper()
-		w.send(typed(":" + query)...)
+		w.send(typed(">" + query)...)
 		found := strings.Contains(w.screen(), row)
 		w.send(press(tea.KeyEsc))
 		return found

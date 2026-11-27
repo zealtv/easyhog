@@ -33,6 +33,7 @@ func FromViewWith(v core.View, ticks TickLookup) Data {
 	if v.DiscoverErr != nil {
 		d.Err = "rescan failed, showing the last list: " + v.DiscoverErr.Error()
 	}
+	var ticked []glanceRow
 	for _, iv := range v.Instances {
 		var info *core.TickInfo
 		if ticks != nil {
@@ -40,7 +41,11 @@ func FromViewWith(v core.View, ticks TickLookup) Data {
 				info = &ti
 			}
 		}
-		d.Nodes = append(d.Nodes, instanceNode(iv, info, ticks != nil))
+		n := instanceNode(iv, info, ticks != nil)
+		d.Nodes = append(d.Nodes, n)
+		if by := tickerOf(iv, info); by != tickedByNone {
+			ticked = append(ticked, glanceRow{by: by, tickFailed: info != nil && info.Ticking && info.LastErr != nil, node: n})
+		}
 	}
 	for _, dg := range v.Diagnostics {
 		msg := ""
@@ -50,6 +55,8 @@ func FromViewWith(v core.View, ticks TickLookup) Data {
 		d.Nodes = append(d.Nodes, Node{Key: "diagnostic:" + dg.Path, Label: dg.Display, State: StateFailed,
 			Detail: "could not be inspected", Preview: "Could not inspect " + dg.Path + "\n\n" + msg})
 	}
+	d.Pane = paneReport(v, ticks)
+	d.Glance = glanceOf(ticked)
 	return d
 }
 

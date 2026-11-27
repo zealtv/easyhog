@@ -75,7 +75,7 @@ func TestHintLinePairsSitThreeSpacesApart(t *testing.T) {
 	if strings.Contains(line, "·") {
 		t.Errorf("hint line still has dots: %q", line)
 	}
-	if !strings.Contains(line, ": commands   ↑↓ select   tab focus") {
+	if !strings.Contains(line, "> commands   ↑↓ select   tab focus") {
 		t.Errorf("hint pairs are not three spaces apart: %q", line)
 	}
 	for w := 1; w <= 100; w++ {
@@ -123,7 +123,7 @@ func TestPaletteGlyphsTakeTheHueOfWhatTheyLeadTo(t *testing.T) {
 // The palette's own key hints use the same three-space gap as the footer's.
 func TestPaletteKeyHintsSitThreeSpacesApart(t *testing.T) {
 	r := newRig(t, &fakeControl{})
-	r.send(typeText(":")...)
+	r.send(typeText(">")...)
 	if screen := r.screen(); !strings.Contains(screen, "↑↓ select   enter run   esc close") {
 		t.Fatalf("palette key hints:\n%s", screen)
 	}

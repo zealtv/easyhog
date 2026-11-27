@@ -205,12 +205,12 @@ func (m Model) emptyLines(w int) []string {
 	if m.data.Err != "" {
 		lines = append(lines, s.state[StateFailed].Render("✗ Could not load instances"))
 		lines = append(lines, wrapPlain(cleanLine(m.data.Err), w)...)
-		lines = append(lines, "", s.hint.Render("Nothing was changed. : opens commands."))
+		lines = append(lines, "", s.hint.Render("Nothing was changed. > opens commands."))
 		return lines
 	}
 	if k := m.hiddenCount(); k > 0 {
 		lines = append(lines, s.soft.Render("No instances to show."))
-		lines = append(lines, wrapPlain(fmt.Sprintf("%s hidden: malformed, legacy or unsupported. Open the palette with : and choose \"Show hidden instances\" (type \"hidden\" or \"show\").", plural(k, "instance is", "instances are")), w)...)
+		lines = append(lines, wrapPlain(fmt.Sprintf("%s hidden: malformed, legacy or unsupported. Open the palette with > and choose \"Show hidden instances\" (type \"hidden\" or \"show\").", plural(k, "instance is", "instances are")), w)...)
 		return lines
 	}
 	lines = append(lines, s.soft.Render("No Groundhog instances to show."))
@@ -482,9 +482,9 @@ func (m Model) status(w int) string {
 	case m.data.Err != "":
 		text = s.warn.Render(" ! load failed")
 	case m.hiddenCount() > 0:
-		text = s.faint.Render(fmt.Sprintf(" %d hidden (malformed, legacy or unsupported) · : then \"show\" lists them", m.hiddenCount()))
+		text = s.faint.Render(fmt.Sprintf(" %d hidden (malformed, legacy or unsupported) · > then \"show\" lists them", m.hiddenCount()))
 	default:
-		text = s.faint.Render(" nothing runs until you choose it · : opens commands")
+		text = s.faint.Render(" nothing runs until you choose it · > opens commands")
 	}
 	return fit(text, w)
 }
@@ -494,7 +494,7 @@ func (m Model) status(w int) string {
 // apart, so the line scans by key rather than by punctuation.
 func (m Model) hintLine(w int) string {
 	s := m.styles
-	all := []hint{{":", "commands"}, {"↑↓", "select"}, {"tab", "focus"}, {"←→", "fold"}, {"⇧↑↓", "scroll"}, {"ctrl+c", "quit"}}
+	all := []hint{{">", "commands"}, {"↑↓", "select"}, {"tab", "focus"}, {"←→", "fold"}, {"⇧↑↓", "scroll"}, {"ctrl+c", "quit"}}
 	var b strings.Builder
 	b.WriteString(" ")
 	used := 1

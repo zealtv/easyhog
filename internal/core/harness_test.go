@@ -269,7 +269,8 @@ func newRig(t *testing.T, fn script, tune func(*Config)) *rig {
 	g := &rig{t: t, root: tempRoot(t), exec: newExec(fn), clk: newClock()}
 	cfg := Config{Root: g.root, FS: discovery.OS{}, Exec: g.exec, Clock: g.clk,
 		Interval: 5 * time.Second, SelectSettle: 500 * time.Millisecond, DiscoverEvery: time.Hour,
-		CallTimeout: 5 * time.Second, Concurrency: 4}
+		CallTimeout: 5 * time.Second, Concurrency: 4,
+		RereadEvery: -1} // the background re-read has tests of its own (reread_test.go)
 	if tune != nil {
 		tune(&cfg)
 	}
