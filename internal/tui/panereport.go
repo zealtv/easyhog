@@ -114,28 +114,28 @@ func shortItemName(id, p string) string {
 	return p[strings.LastIndex(p, "/")+1:]
 }
 
-// nextLine is the map's ready line for w, read against now: "report at
+// nextLine is the map's ready line for w, read against now: "next: report at
 // 10:52 · alpha" (with the weekday, "Mon 10:52", when not today), or
 // "report due · alpha" once its time has come and the
-// next tick will fire it. The map adds "next: " itself.
+// next tick will fire it. The map adds no label, so "next: " is written here.
 func nextLine(w *PaneWake, now time.Time) string {
 	if w == nil {
 		return ""
 	}
 	if !w.Due.After(now) {
-		return w.Item + " due · " + w.Instance
+		return "next: " + w.Item + " due · " + w.Instance
 	}
 	due, today := w.Due.Local(), now.Local()
 	when := due.Format("15:04")
 	if y, m, d := due.Date(); y != today.Year() || m != today.Month() || d != today.Day() {
 		when = due.Format("Mon 15:04")
 	}
-	return w.Item + " at " + when + " · " + w.Instance
+	return "next: " + w.Item + " at " + when + " · " + w.Instance
 }
 
 // paneValues is what the pane's options should say now.
 func (m Model) paneValues() twpane.Values {
-	v := twpane.Values{twpane.Next: nextLine(m.data.Pane.Next, m.now)}
+	v := twpane.Values{twpane.Idle: nextLine(m.data.Pane.Next, m.now)}
 	if m.paneFail.text != "" {
 		v[twpane.Status] = "fail"
 		v[twpane.StatusText] = m.paneFail.text

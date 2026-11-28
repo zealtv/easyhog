@@ -41,13 +41,13 @@ func TestPaneReportNextIsTheSoonestWakeThisSessionTicks(t *testing.T) {
 	if r.Next == nil || r.Next.Item != "soon" || r.Next.Instance != "a" || !r.Next.Due.Equal(t0.Add(30*time.Minute)) {
 		t.Fatalf("next = %+v", r.Next)
 	}
-	if got := nextLine(r.Next, t0); got != "soon at 10:30 · a" {
+	if got := nextLine(r.Next, t0); got != "next: soon at 10:30 · a" {
 		t.Errorf("line = %q", got)
 	}
-	if got := nextLine(r.Next, t0.Add(31*time.Minute)); got != "soon due · a" {
+	if got := nextLine(r.Next, t0.Add(31*time.Minute)); got != "next: soon due · a" {
 		t.Errorf("line once due = %q", got)
 	}
-	if got := nextLine(&PaneWake{Item: "weekly", Instance: "a", Due: t0.Add(72 * time.Hour)}, t0); got != "weekly at Mon 10:00 · a" {
+	if got := nextLine(&PaneWake{Item: "weekly", Instance: "a", Due: t0.Add(72 * time.Hour)}, t0); got != "next: weekly at Mon 10:00 · a" {
 		t.Errorf("line on another day = %q", got)
 	}
 	if r := paneReport(v, ticks()); r.Next != nil || r.Fail != "" {
@@ -121,7 +121,7 @@ func runAll(cmd tea.Cmd) {
 	}
 }
 
-// The model writes @tw-next and the failure to its own pane only when they
+// The model writes @tw-idle and the failure to its own pane only when they
 // change, keeps the failure's start time across snapshots, and clears them when
 // they clear.
 func TestModelReportsNextAndFailOnItsOwnPane(t *testing.T) {
@@ -136,7 +136,7 @@ func TestModelReportsNextAndFailOnItsOwnPane(t *testing.T) {
 	look := ticks("/r/a/.groundhog")
 	m, cmd := feed(m, SnapshotMsg{Data: FromViewWith(core.View{Instances: []core.InstanceView{good}}, look)})
 	runAll(cmd)
-	if got := rec.all(); !strings.Contains(got, "set-option -p -t %7 @tw-next soon at 10:30 · a") || !strings.Contains(got, "set-option -pu -t %7 @tw_status") {
+	if got := rec.all(); !strings.Contains(got, "set-option -p -t %7 @tw-idle next: soon at 10:30 · a") || !strings.Contains(got, "set-option -pu -t %7 @tw_status") {
 		t.Fatalf("first write = %q", got)
 	}
 	rec.calls = nil
@@ -164,7 +164,7 @@ func TestModelReportsNextAndFailOnItsOwnPane(t *testing.T) {
 	m, cmd = feed(m, SnapshotMsg{Data: FromViewWith(core.View{Instances: []core.InstanceView{good}}, ticks())})
 	runAll(cmd)
 	got = rec.all()
-	for _, opt := range []string{"@tw-next", "@tw_status", "@tw_status_text", "@tw_status_at"} {
+	for _, opt := range []string{"@tw-idle", "@tw_status", "@tw_status_text", "@tw_status_at"} {
 		if !strings.Contains(got, "set-option -pu -t %7 "+opt) {
 			t.Errorf("stopping ticking did not unset %s: %q", opt, got)
 		}
@@ -173,7 +173,7 @@ func TestModelReportsNextAndFailOnItsOwnPane(t *testing.T) {
 	if err := m.pane.Clear(); err != nil {
 		t.Fatal(err)
 	}
-	if got := rec.all(); !strings.Contains(got, "set-option -pu -t %7 @tw-next") {
+	if got := rec.all(); !strings.Contains(got, "set-option -pu -t %7 @tw-idle") {
 		t.Errorf("clear = %q", got)
 	}
 }
@@ -183,7 +183,7 @@ func TestModelWithoutAPaneWritesNothing(t *testing.T) {
 	m := NewWithData(Data{}, WithoutClockTicks())
 	good := withItems(supported("a"), dueItem("schedule/daily/10/soon", time.Now().Add(time.Hour)))
 	_, cmd := feed(m, SnapshotMsg{Data: FromViewWith(core.View{Instances: []core.InstanceView{good}}, ticks("/r/a/.groundhog"))})
-	if m.pane.Sync(twpane.Values{twpane.Next: "x"}) != nil {
+	if m.pane.Sync(twpane.Values{twpane.Idle: "x"}) != nil {
 		t.Error("a zero pane made a command")
 	}
 	runAll(cmd)

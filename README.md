@@ -69,16 +69,7 @@ own, so runs carry on after Easyhog quits. Easyhog is not a daemon: to keep sche
 firing, leave it open in a spare terminal, or tick from cron or `groundhog.sh run`, which
 Easyhog shows beside its own.
 
-Inside tmux, Easyhog marks where its instance list is, so a tool that shows a small live
-preview of the pane can show the list rather than a corner of the screen: it keeps the pane
-option `@tw-focus` set to `x,y,w,h`, the list in the pane's cells. It also keeps two more
-for a map of tmux windows: `@tw-next`, the next wake among the instances it ticks
-(`report at 10:30 · alpha`), and, while one of their wakes has failed, `@tw_status` set to
-`fail` with the reason in `@tw_status_text`. Its glance is two more: `@tw-glance-far`, a
-badge line (`:hog;ok:●2;other:◇3;bad:✗1`: instances it ticks, ticked from outside, failed),
-and `@tw-glance-mid`, one row per ticked instance (`ok:● alpha;other:◇ beta`), paused and
-failed ones with the tree's `◐` and `✗`. Every option goes on Easyhog's own pane, and Quit
-unsets `@tw-next`, the status and the glance.
+Easyhog has a glance for [Tireless Watcher](https://github.com/zealtv/tireless-watcher).
 
 ## Licence and contributing
 

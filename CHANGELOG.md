@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.1 (2026-11-28)
+
+- Easyhog has a glance for [Tireless Watcher](https://github.com/zealtv/tireless-watcher); the README says so in one line.
+- Inside tmux, the `@tw-idle` option replaces `@tw-next` for the map of windows.
+- The README drops its detail on the glance.
+
 ## v0.3.0 (2026-11-27)
 
 Easyhog reports what it sees to a map of tmux windows, and its palette moves to `>`.
